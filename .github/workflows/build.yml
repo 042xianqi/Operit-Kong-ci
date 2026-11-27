@@ -250,6 +250,10 @@ jobs:
 
       - name: Build native ripgrep
         shell: bash
+        env:
+          # Android 15+ 要求 .so 的 LOAD 段 16 KB 对齐；NDK r28 的 Rust 链接
+          # 默认仍是 4 KB，必须显式抬高，否则设备会弹“未对齐”警告。
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
         run: |
           set -euo pipefail
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
@@ -267,6 +271,8 @@ jobs:
           test -s app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
       - name: Build native xml group
         shell: bash
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
         run: |
           set -euo pipefail
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
