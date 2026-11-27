@@ -508,6 +508,9 @@ private fun extractXmlTagName(xml: String): String? {
 }
 
 private fun extractRawXmlTagName(xml: String): String? {
+    // 先走 Rust：流式渲染时这里每帧每节点都会调用，正则每次都要分配 Matcher。
+    // Rust 不可用时（库未加载/异常）回退到原正则，行为不变。
+    NativeXmlGroup.tagName(xml)?.let { return it }
     return ChatMarkupRegex.extractOpeningTagName(xml)
 }
 
