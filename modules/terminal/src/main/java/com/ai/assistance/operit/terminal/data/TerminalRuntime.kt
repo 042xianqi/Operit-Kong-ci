@@ -33,6 +33,9 @@ data class TerminalRuntime(
      * 不再带 rc 文件：应用提示符由宿主环境变量注入（ash 用 `ENV`，bash 用
      * `PROMPT_COMMAND`），本地终端也不需要经过这份脚本。
      */
+    /** 当前实例用哪个包管理器。源配置与包管理器必须一致，否则装不上。 */
+    val packageTool: PackageTool get() = PackageTool.of(packageSource)
+
     fun buildLoginCommand(): String =
         (listOf(shellPath) + shellArgs).joinToString(" ")
 
@@ -123,4 +126,51 @@ sealed interface PackageSourceSpec {
                     append("$baseUrl/$suite/community\n")
                 }
         }
+}
+
+/**
+ * 包管理器在这一层能做的事。
+ *
+ * SetupScreen 原本把 apt-get / dpkg -s 写死在 UI 里，而默认实例是 apk。
+ * 用户在 Alpine 实例上点任何一项都会 apt-get: not found，页面看起来是坏的。
+ * 把差异收到这里：UI 只问怎么装、怎么查，不再自己拼发行版命令。
+ */
+enum class PackageTool(
+    /** 包管理器可执行文件名。 */
+    val executable: String,
+    /** 安装命令前缀（不含包名）。 */
+    val installPrefix: List<String>,
+    /** 判断包是否已装；exit code 0 表示已装。 */
+    val queryCommand: (String) -> List<String>,
+) {
+    APK(
+        executable = "apk",
+        installPrefix = listOf("apk", "add", "--no-cache"),
+        // apk info -e 只查已装数据库，不联网，适合逐项探测。
+        queryCommand = { pkg -> listOf("apk", "info", "-e", pkg) },
+    ),
+    APT(
+        executable = "apt-get",
+        installPrefix = listOf("apt-get", "install", "-y"),
+        queryCommand = { pkg -> listOf("dpkg", "-s", pkg) },
+    ),
+    DNF(
+        executable = "dnf",
+        installPrefix = listOf("dnf", "install", "-y"),
+        queryCommand = { pkg -> listOf("rpm", "-q", pkg) },
+    ),
+    ;
+
+    /** 一次装多个包。 */
+    fun installCommand(packages: List<String>): List<String> =
+        if (packages.isEmpty()) emptyList() else installPrefix + packages
+
+    companion object {
+        /** 由源配置反推包管理器：两者必须同一套。 */
+        fun of(source: PackageSourceSpec?): PackageTool = when (source) {
+            PackageSourceSpec.AlpineRepositories -> APK
+            PackageSourceSpec.AptSourcesList -> APT
+            null -> APT
+        }
+    }
 }
