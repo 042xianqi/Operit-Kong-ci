@@ -51,6 +51,9 @@ internal object TerminalOutputCompressor {
     )
 
     fun compress(command: String, output: String): Summary? {
+        // 先走 Rust：这条路径处理长构建日志，正则开销是主要成本。
+        // 不可用时回退到下面的 Kotlin 实现，行为不变。
+        NativeOutputCompress.compress(command, output)?.let { return it }
         if (output.length < 2000) return null
         val tool = identifyTool(command) ?: return null
         val plain = sgr.replace(output, "")
