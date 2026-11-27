@@ -394,8 +394,7 @@ fn is_csv_header(s: &str) -> bool {
     }
     cols.iter().all(|c| {
         !c.is_empty()
-            && c.chars()
-                .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | b'.' as char | b':' as char | b'-' as char))
+            && c.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '.' | ':' | '-'))
     })
 }
 
