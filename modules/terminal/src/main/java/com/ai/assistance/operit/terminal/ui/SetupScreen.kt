@@ -138,7 +138,7 @@ fun SetupScreen(
                     name = "Rust",
                     description = "编译 Rust 项目，本工程的 native 库需要",
                     packages = listOf(
-                        PackageItem("rust", "rustup", "RUST_INSTALL_COMMAND", "Rust 工具链安装器", alpinePackage = "rust"),
+                        PackageItem("rust", "rustup", "rust", "Rust 工具链安装器，安装后由 rustup 自己管理版本", alpinePackage = "rust"),
                         PackageItem("cargo", "cargo", "cargo", "Rust 包管理器", alpinePackage = "cargo"),
                     )
                 ),
@@ -718,6 +718,9 @@ private suspend fun checkPackageInstalled(
         "gradle" -> "command -v gradle"
         "cargo" -> "command -v cargo"
         "pip" -> "command -v pip3 || command -v pip"
+        // tar/unzip 由 busybox 提供，apk 数据库里没有独立包，只能看 applet 是否可用。
+        "tar" -> "tar --help >/dev/null 2>&1"
+        "unzip" -> "busybox unzip 2>&1 | grep -q Usage"
         else -> tool.queryCommand(pkg.packageNameFor(tool)).joinToString(" ")
     }
     val marker = "OPERIT_PROBE_RC="
