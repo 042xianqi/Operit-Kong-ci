@@ -16,6 +16,10 @@ pluginManagement {
             name = "AliyunGradlePlugin"
             url = uri("https://maven.aliyun.com/repository/gradle-plugin")
         }
+        // 兜底：阿里云 gradle-plugin 镜像缺 kotlin-kapt 2.2.21 等较新插件，
+        // 没有插件门户时 CI（无本地缓存）会在配置阶段直接失败。
+        gradlePluginPortal()
+        mavenCentral()
     }
 }
 dependencyResolutionManagement {
