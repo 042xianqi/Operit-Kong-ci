@@ -285,6 +285,14 @@ jobs:
             tools/native_xml_group/target/aarch64-linux-android/release/liboperit_xml_group.so \
             app/src/main/jniLibs/arm64-v8a/liboperit_xml_group.so
           test -s app/src/main/jniLibs/arm64-v8a/liboperit_xml_group.so
+          cargo "+$RUST_VERSION" build \
+            --manifest-path tools/native_output_compress/Cargo.toml \
+            --release \
+            --target aarch64-linux-android
+          install -Dm755 \
+            tools/native_output_compress/target/aarch64-linux-android/release/liboperit_output_compress.so \
+            app/src/main/jniLibs/arm64-v8a/liboperit_output_compress.so
+          test -s app/src/main/jniLibs/arm64-v8a/liboperit_output_compress.so
 
       - name: Install JavaScript dependencies
         shell: bash
