@@ -364,3 +364,98 @@ mod closed_tests {
         assert!(!is_fully_closed("plain text"));
     }
 }
+
+/// 提取 `name="..."` 属性值，与 Kotlin 正则 `name\s*=\s*"([^"]+)"`（IGNORE_CASE）同语义。
+///
+/// 流式渲染每帧对每个 tool 节点都会调用；Kotlin 侧每次分配 Matcher，
+/// 这里直接线性扫描，不产生中间对象。
+/// 返回 None 表示没有匹配或值为空。
+pub fn name_attr(xml: &str) -> Option<&str> {
+    let bytes = xml.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        // 找 name（不区分大小写）
+        if i + 4 <= n && bytes[i..i + 4].eq_ignore_ascii_case(b"name") {
+            let mut j = i + 4;
+            // \s*
+            while j < n && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
+                j += 1;
+            }
+            if j < n && bytes[j] == b'=' {
+                j += 1;
+                while j < n && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
+                    j += 1;
+                }
+                if j < n && bytes[j] == b'"' {
+                    j += 1;
+                    let start = j;
+                    while j < n && bytes[j] != b'"' {
+                        j += 1;
+                    }
+                    // [^"]+ 至少一个字符
+                    if j > start && j < n {
+                        return xml.get(start..j);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// name_attr 的 JNI 入口。
+#[no_mangle]
+pub extern "system" fn Java_com_ai_assistance_operit_ui_common_markdown_NativeXmlGroup_nameAttrJni(
+    mut env: JNIEnv,
+    _class: JClass,
+    xml: JString,
+) -> jstring {
+    let text: String = match env.get_string(&xml) {
+        Ok(v) => v.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match name_attr(&text) {
+        Some(v) => match env.new_string(v) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[cfg(test)]
+mod name_attr_tests {
+    use super::name_attr;
+
+    #[test]
+    fn plain() {
+        assert_eq!(name_attr("<tool name=\"bash\">"), Some("bash"));
+    }
+
+    #[test]
+    fn with_spaces() {
+        assert_eq!(name_attr("<tool name = \"a b\">"), Some("a b"));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert_eq!(name_attr("<tool NAME=\"x\">"), Some("x"));
+    }
+
+    #[test]
+    fn empty_value_is_none() {
+        assert_eq!(name_attr("<tool name=\"\">"), None);
+    }
+
+    #[test]
+    fn no_name() {
+        assert_eq!(name_attr("<tool>"), None);
+    }
+
+    #[test]
+    fn single_quote_not_matched() {
+        assert_eq!(name_attr("<tool name='x'>"), None);
+    }
+}
