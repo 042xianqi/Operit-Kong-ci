@@ -761,6 +761,21 @@ android {
             // The legacy packaging path repacks the libs without 16 KB LOAD
             // alignment, which is what raises the compatibility dialog on launch.
             useLegacyPackaging = true
+            // FFmpeg/AAR 里的这些 .so 已是最终产物（16 KB 对齐、已 strip 过）。
+            // 再走一次 llvm-strip 会报 “SHT_STRTAB ... non-null terminated”，
+            // 因为对齐填充后的段表不再满足 strip 的假设。
+            keepDebugSymbols += listOf(
+                "libavcodec.so",
+                "libavdevice.so",
+                "libavfilter.so",
+                "libavformat.so",
+                "libavutil.so",
+                "libc++_shared.so",
+                "libffmpegkit.so",
+                "libffmpegkit_abidetect.so",
+                "libswresample.so",
+                "libswscale.so",
+            )
         }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
