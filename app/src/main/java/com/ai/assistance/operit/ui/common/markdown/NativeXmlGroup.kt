@@ -79,6 +79,25 @@ internal object NativeXmlGroup {
         }
     }
 
+
+    @JvmStatic
+    private external fun isFullyClosedJni(xml: String): Boolean
+
+    /**
+     * 判断 XML 片段是否完整闭合。
+     *
+     * 流式渲染每帧对每个节点都会调用，Rust 侧一次线性扫描替代 Kotlin 的
+     * trim/endsWith/contains 三次字符串操作。失败时返回 null，调用方回退。
+     */
+    internal fun isFullyClosed(xml: String): Boolean? {
+        if (!loaded || xml.isEmpty()) return null
+        return try {
+            isFullyClosedJni(xml)
+        } catch (error: Throwable) {
+            null
+        }
+    }
+
     internal fun iconFor(semantic: String): String? {
         if (!loaded || semantic.isBlank()) return null
         val raw = try {
