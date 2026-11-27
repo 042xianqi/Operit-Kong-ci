@@ -7,8 +7,8 @@ METADATA
         "en": "Super Admin"
     },
     "description": {
-        "zh": "超级管理员工具集，提供终端命令和Shell操作的高级功能。terminal工具运行在Ubuntu环境中（已正确挂载sdcard和storage），shell工具通过Shizuku/Root直接执行Android系统命令。适合需要进行底层系统管理和命令行操作的场景。",
-        "en": "Super admin toolkit providing advanced terminal and shell capabilities. The terminal tool runs in an Ubuntu environment (with sdcard/storage mounted). The shell tool executes Android system commands directly via Shizuku/Root. Useful for low-level system administration and CLI operations."
+        "zh": "超级管理员工具集，提供终端命令和Shell操作的高级功能。terminal 工具运行在 proot 容器中，默认实例是 Alpine（包管理器 apk，不是 apt）。运行前先确认发行版：`cat /etc/os-release`。已有工具不要重复安装：node/npm/pnpm/python3/uv 在 Alpine 中已预装。安装软件必须用对应包管理器：Alpine 用 `apk add`，Ubuntu/Debian 用 `apt-get install`，Fedora 用 `dnf install`；在 Alpine 上用 apt 会失败。shell 工具通过 Shizuku/Root 直接执行 Android 系统命令。",
+        "en": "Super admin toolkit for terminal and shell operations. The terminal tool runs inside a proot container whose default instance is Alpine (package manager is apk, NOT apt). Check the distribution first with `cat /etc/os-release`. Do not reinstall what already exists: node/npm/pnpm/python3/uv are preinstalled on Alpine. Always use the matching package manager: `apk add` on Alpine, `apt-get install` on Ubuntu/Debian, `dnf install` on Fedora; using apt on Alpine fails. The shell tool executes Android system commands directly via Shizuku/Root."
     },
     "enabledByDefault": true,
     "category": "System",
@@ -16,8 +16,8 @@ METADATA
         {
             "name": "terminal",
             "description": {
-                "zh": "在Ubuntu环境中执行命令并收集输出结果。运行环境：完整的Ubuntu系统，已正确挂载sdcard和storage目录，可访问Android存储空间。所有命令将会在相同的会话执行且上下文连贯。强烈建议每次都显式传 timeoutMs，避免命令卡住。禁止使用 `set -e`、`set -o errexit` 等会改变 shell 退出行为的命令，这会导致终端会话退出并返回失败。若未传，前台默认15秒超时；background=true 时不使用该默认超时。命令超时时精确取消本次命令；无法恢复时关闭会话。",
-                "en": "Execute commands in an Ubuntu environment and collect output. Environment: full Ubuntu system with sdcard/storage mounted, allowing access to Android storage. Automatically preserves working-directory context. Strongly recommend explicitly passing timeoutMs every time to avoid hangs. Do not use commands such as `set -e` or `set -o errexit` that change shell exit behavior, because they can terminate the terminal session and return failure. If omitted, foreground mode defaults to 15s timeout; background=true does not use this default timeout. Timeout cancels this command precisely; an unrecoverable session is closed."
+                "zh": "在 proot 容器中执行命令并收集输出。默认实例是 Alpine：包管理器是 apk，不要用 apt。首次使用先运行 `cat /etc/os-release` 确认发行版。已预装（不必重装）：node、npm、pnpm、python3、uv、bash、busybox（提供 tar/unzip/find 等）。未预装：curl、wget、git、ssh、gcc、make、cmake。安装方式按发行版：Alpine `apk add <pkg>`，Ubuntu/Debian `apt-get install -y <pkg>`，Fedora `dnf install -y <pkg>`。已挂载 sdcard 与 storage，可直接访问 Android 存储。会话内工作目录保持，上下文连贯。强烈建议每次显式传 timeoutMs。禁止使用 `set -e`、`set -o errexit` 等会改变 shell 退出行为的命令，这会导致会话退出并返回失败。未传 timeoutMs 时前台默认 15 秒；background=true 不使用该默认值。超时会精确取消本次命令。",
+                "en": "Run commands inside a proot container and collect output. Default instance is Alpine: package manager is apk, not apt. First run `cat /etc/os-release` to confirm the distribution. Preinstalled (no need to install): node, npm, pnpm, python3, uv, bash, busybox (provides tar/unzip/find). Not preinstalled: curl, wget, git, ssh, gcc, make, cmake. Install per distribution: `apk add <pkg>` on Alpine, `apt-get install -y <pkg>` on Ubuntu/Debian, `dnf install -y <pkg>` on Fedora. sdcard and storage are mounted, so Android storage is directly accessible. Working directory persists across commands. Strongly recommend passing timeoutMs explicitly. Do not use `set -e` or `set -o errexit`, which change shell exit behavior and can terminate the session with a failure. Without timeoutMs, foreground defaults to 15s; background=true does not use that default. Timeout cancels only this command."
             },
             "parameters": [
                 {
