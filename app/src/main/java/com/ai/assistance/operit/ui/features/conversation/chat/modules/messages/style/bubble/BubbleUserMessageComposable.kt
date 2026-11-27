@@ -100,8 +100,8 @@ fun BubbleUserMessageComposable(
     enableWaterGlass: Boolean = false,
     bubbleImageStyle: BubbleImageStyleConfig? = null,
     bubbleRoundedCornersEnabled: Boolean = true,
-    bubbleContentPaddingLeft: Float = 12f,
-    bubbleContentPaddingRight: Float = 12f,
+    bubbleContentPaddingLeft: Float = 10f,
+    bubbleContentPaddingRight: Float = 10f,
     enableDialogs: Boolean = true,
 ) {
     val context = LocalContext.current
@@ -414,9 +414,9 @@ fun BubbleUserMessageComposable(
                                 contentPadding =
                                     PaddingValues(
                                         start = bubbleContentPaddingLeft.dp,
-                                        top = if (isHiddenPlaceholder) 0.dp else 12.dp,
+                                        top = if (isHiddenPlaceholder) 0.dp else 8.dp,
                                         end = bubbleContentPaddingRight.dp,
-                                        bottom = if (isHiddenPlaceholder) 0.dp else 12.dp,
+                                        bottom = if (isHiddenPlaceholder) 0.dp else 8.dp,
                                     ),
                             ) {
                                 ThemeScriptSurface("userMessage", messageDecorationOpacity, drawFill = true, originalShape = bubbleShape) {
@@ -495,16 +495,16 @@ fun BubbleUserMessageComposable(
                                                 voiceMessage.waveform, voiceMessage.transcript,
                                                 embedded = true, contentColor = effectiveTextColor, missingState = voiceFileMissing,
                                                 modifier = Modifier.padding(start = bubbleContentPaddingLeft.dp, end = bubbleContentPaddingRight.dp,
-                                                    top = 12.dp, bottom = 12.dp))
+                                                    top = 8.dp, bottom = 8.dp))
                                         } else {
                                             Text(
                                                 text = textContent,
                                                 modifier =
                                                 Modifier.padding(
                                                     start = bubbleContentPaddingLeft.dp,
-                                                    top = 12.dp,
+                                                    top = 8.dp,
                                                     end = bubbleContentPaddingRight.dp,
-                                                    bottom = 12.dp,
+                                                    bottom = 8.dp,
                                                 ),
                                                 color = effectiveTextColor,
                                                 style = MaterialTheme.typography.bodyMedium,
@@ -573,9 +573,9 @@ fun BubbleUserMessageComposable(
                                 contentPadding =
                                     PaddingValues(
                                         start = bubbleContentPaddingLeft.dp,
-                                        top = if (isHiddenPlaceholder) 0.dp else 12.dp,
+                                        top = if (isHiddenPlaceholder) 0.dp else 8.dp,
                                         end = bubbleContentPaddingRight.dp,
-                                        bottom = if (isHiddenPlaceholder) 0.dp else 12.dp,
+                                        bottom = if (isHiddenPlaceholder) 0.dp else 8.dp,
                                     ),
                             ) {
                                 ThemeScriptSurface("userMessage", messageDecorationOpacity, drawFill = true, originalShape = bubbleShape) {
@@ -654,16 +654,16 @@ fun BubbleUserMessageComposable(
                                                 voiceMessage.waveform, voiceMessage.transcript,
                                                 embedded = true, contentColor = effectiveTextColor, missingState = voiceFileMissing,
                                                 modifier = Modifier.padding(start = bubbleContentPaddingLeft.dp, end = bubbleContentPaddingRight.dp,
-                                                    top = 12.dp, bottom = 12.dp))
+                                                    top = 8.dp, bottom = 8.dp))
                                         } else {
                                             Text(
                                                 text = textContent,
                                                 modifier =
                                                 Modifier.padding(
                                                     start = bubbleContentPaddingLeft.dp,
-                                                    top = 12.dp,
+                                                    top = 8.dp,
                                                     end = bubbleContentPaddingRight.dp,
-                                                    bottom = 12.dp,
+                                                    bottom = 8.dp,
                                                 ),
                                                 color = effectiveTextColor,
                                                 style = MaterialTheme.typography.bodyMedium
