@@ -130,7 +130,7 @@ fun SetupScreen(
                         PackageItem("nodejs", "Node.js", "nodejs", "运行时", alpinePackage = "nodejs", preinstalled = true),
                         PackageItem("npm", "npm", "npm", "包管理器", alpinePackage = "npm", preinstalled = true),
                         PackageItem("pnpm", "pnpm", "pnpm", "更省磁盘的包管理器", alpinePackage = "pnpm", preinstalled = true),
-                        PackageItem("typescript", "TypeScript", "typescript", "类型系统编译到 JS", alpinePackage = ""),
+                        PackageItem("typescript", "TypeScript", "typescript", "类型系统编译到 JS（走 npm，Alpine 无独立包）", alpinePackage = ""),
                     )
                 ),
                 PackageCategory(
