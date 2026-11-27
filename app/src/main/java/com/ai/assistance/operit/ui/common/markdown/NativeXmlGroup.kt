@@ -98,6 +98,25 @@ internal object NativeXmlGroup {
         }
     }
 
+
+    @JvmStatic
+    private external fun nameAttrJni(xml: String): String?
+
+    /**
+     * 提取 `name="..."` 属性值。
+     *
+     * 与 `ChatMarkupRegex.nameAttr` 同语义；流式渲染每帧对每个 tool 节点调用，
+     * Rust 侧线性扫描替代正则 Matcher 分配。失败返回 null，调用方回退。
+     */
+    internal fun nameAttr(xml: String): String? {
+        if (!loaded || xml.isEmpty()) return null
+        return try {
+            nameAttrJni(xml)?.takeIf { it.isNotEmpty() }
+        } catch (error: Throwable) {
+            null
+        }
+    }
+
     internal fun iconFor(semantic: String): String? {
         if (!loaded || semantic.isBlank()) return null
         val raw = try {
