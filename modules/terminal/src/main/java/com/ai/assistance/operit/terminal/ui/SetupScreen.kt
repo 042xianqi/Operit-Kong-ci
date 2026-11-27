@@ -22,6 +22,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ai.assistance.operit.terminal.TerminalManager
 import com.ai.assistance.operit.terminal.data.PackageManagerType
+import com.ai.assistance.operit.terminal.data.PackageTool
+import com.ai.assistance.operit.terminal.data.TerminalRuntime
 import com.ai.assistance.operit.terminal.utils.SourceManager
 import com.ai.assistance.operit.terminal.utils.SSHConfigManager
 import kotlinx.coroutines.CompletableDeferred
@@ -148,6 +150,12 @@ fun SetupScreen(
     // 新增：跟踪包的安装状态
     val packageStatus = remember { mutableStateMapOf<String, InstallStatus>() }
     val terminalManager = remember(context) { TerminalManager.getInstance(context) }
+
+    // 当前实例的包管理器：Alpine 是 apk，Ubuntu 是 apt。探测与安装都要跟它一致。
+    val activeTool by produceState(PackageTool.APT, Unit) {
+        value = runCatching { terminalManager.activeRuntime() }
+            .getOrDefault(TerminalRuntime.DEBIAN_LIKE).packageTool
+    }
     val coroutineScope = rememberCoroutineScope()
     var checkSessionId by remember { mutableStateOf<String?>(null) }
 
@@ -185,7 +193,7 @@ fun SetupScreen(
         // 并发检查所有包
         allPackages.forEach { pkg ->
             launch {
-                val isInstalled = checkPackageInstalled(terminalManager, sessionId, pkg, this)
+                val isInstalled = checkPackageInstalled(terminalManager, sessionId, pkg, this, activeTool)
                 if (isInstalled) {
                     packageStatus[pkg.id] = InstallStatus.INSTALLED
                     selectedPackages[pkg.id] = true
@@ -635,7 +643,8 @@ private suspend fun checkPackageInstalled(
     terminalManager: TerminalManager,
     sessionId: String,
     pkg: PackageItem,
-    scope: CoroutineScope
+    scope: CoroutineScope,
+    tool: PackageTool
 ): Boolean {
     val command: String = when (pkg.id) {
         "rust" -> "command -v rustc"
@@ -647,7 +656,8 @@ private suspend fun checkPackageInstalled(
         "sshpass" -> "command -v sshpass"
         "openssh-server" -> "command -v sshd"
         "gradle" -> "command -v gradle"
-        else -> "dpkg -s ${pkg.command.split(" ").first()}"
+        // 不能写死 dpkg：默认实例的包管理器是 apk，dpkg 不存在。
+        else -> tool.queryCommand(pkg.command.split(" ").first()).joinToString(" "),
     }
 
     val output = executeCommandAndGetOutput(terminalManager, sessionId, command, scope)
@@ -663,7 +673,8 @@ private suspend fun checkPackageInstalled(
         }
         "rust", "uv", "go", "ssh", "sshpass", "openssh-server", "gradle" -> output.isNotBlank() && !output.contains("not found")
         "pnpm" -> output.contains("FOUND_PNPM")
-        else -> output.contains("Status: install ok installed")
+        // dpkg -s 成功时含 Status: install ok installed；apk info -e 成功时无输出但 exit 0。
+        else -> !output.contains("not found")
     }
 }
 
