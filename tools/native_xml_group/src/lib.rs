@@ -1,5 +1,5 @@
 use jni::objects::{JClass, JObjectArray, JString};
-use jni::sys::jstring;
+use jni::sys::{jboolean, jstring};
 use jni::JNIEnv;
 use serde::Serialize;
 
