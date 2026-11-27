@@ -51,6 +51,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -297,7 +298,7 @@ internal fun ClassicChatInputContent(
     val currentWindowSize = runtime.currentWindowSize
     val maxWindowSizeInK = runtime.maxWindowSizeInK
     val maxTokens = (maxWindowSizeInK * 1024).toLong().coerceAtLeast(0L)
-    val userMessageTokens = remember(userMessage.text) { ChatUtils.estimateTokenCount(userMessage.text) }
+    val userMessageTokens by remember { derivedStateOf { ChatUtils.estimateTokenCount(userMessage.text) } }
     val projectedTokens = userMessageTokens.toLong() + currentWindowSize
 
     val isOverTokenLimit =
