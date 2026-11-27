@@ -7,8 +7,8 @@ METADATA
         "en": "Super Admin"
     },
     "description": {
-        "zh": "超级管理员工具集，提供终端命令和Shell操作的高级功能。terminal工具运行在Ubuntu环境中（已正确挂载sdcard和storage），shell工具通过Shizuku/Root直接执行Android系统命令。适合需要进行底层系统管理和命令行操作的场景。",
-        "en": "Super admin toolkit providing advanced terminal and shell capabilities. The terminal tool runs in an Ubuntu environment (with sdcard/storage mounted). The shell tool executes Android system commands directly via Shizuku/Root. Useful for low-level system administration and CLI operations."
+        "zh": "超级管理员工具集，提供终端命令和Shell操作的高级功能。terminal 工具运行在 proot 容器中，默认实例是 Alpine（包管理器 apk，不是 apt）。运行前先确认发行版：`cat /etc/os-release`。已有工具不要重复安装：node/npm/pnpm/python3/uv 在 Alpine 中已预装。安装软件必须用对应包管理器：Alpine 用 `apk add`，Ubuntu/Debian 用 `apt-get install`，Fedora 用 `dnf install`；在 Alpine 上用 apt 会失败。shell 工具通过 Shizuku/Root 直接执行 Android 系统命令。",
+        "en": "Super admin toolkit for terminal and shell operations. The terminal tool runs inside a proot container whose default instance is Alpine (package manager is apk, NOT apt). Check the distribution first with `cat /etc/os-release`. Do not reinstall what already exists: node/npm/pnpm/python3/uv are preinstalled on Alpine. Always use the matching package manager: `apk add` on Alpine, `apt-get install` on Ubuntu/Debian, `dnf install` on Fedora; using apt on Alpine fails. The shell tool executes Android system commands directly via Shizuku/Root."
     },
     "enabledByDefault": true,
     "category": "System",
@@ -16,8 +16,8 @@ METADATA
         {
             "name": "terminal",
             "description": {
-                "zh": "在Ubuntu环境中执行命令并收集输出结果。运行环境：完整的Ubuntu系统，已正确挂载sdcard和storage目录，可访问Android存储空间。所有命令将会在相同的会话执行且上下文连贯。强烈建议每次都显式传 timeoutMs，避免命令卡住。禁止使用 `set -e`、`set -o errexit` 等会改变 shell 退出行为的命令，这会导致终端会话退出并返回失败。若未传，前台默认15秒超时；background=true 时不使用该默认超时。命令超时时精确取消本次命令；无法恢复时关闭会话。",
-                "en": "Execute commands in an Ubuntu environment and collect output. Environment: full Ubuntu system with sdcard/storage mounted, allowing access to Android storage. Automatically preserves working-directory context. Strongly recommend explicitly passing timeoutMs every time to avoid hangs. Do not use commands such as `set -e` or `set -o errexit` that change shell exit behavior, because they can terminate the terminal session and return failure. If omitted, foreground mode defaults to 15s timeout; background=true does not use this default timeout. Timeout cancels this command precisely; an unrecoverable session is closed."
+                "zh": "在 proot 容器中执行命令并收集输出。默认实例是 Alpine：包管理器是 apk，不要用 apt。首次使用先运行 `cat /etc/os-release` 确认发行版，或直接调 terminal_env 一次拿到全貌。已预装（不必重装）：node、npm、pnpm、python3、uv、bash、busybox。未预装：curl、wget、git、ssh、gcc、make、cmake。安装方式按发行版：Alpine `apk add <pkg>`，Ubuntu/Debian `apt-get install -y <pkg>`，Fedora `dnf install -y <pkg>`。常用命令：查发行版 `cat /etc/os-release`，查已装包 `apk info -e <pkg>`，列文件 `ls -la`，搜索内容 `grep -rn 'x' .`，看磁盘 `df -h`，看进程 `ps aux`，解压 `tar -xzf a.tar.gz` / `busybox unzip a.zip`。已挂载 sdcard 与 storage，可直接访问 Android 存储。会话内工作目录保持，上下文连贯。强烈建议每次显式传 timeoutMs。禁止使用 `set -e`、`set -o errexit` 等会改变 shell 退出行为的命令，这会导致会话退出并返回失败。未传 timeoutMs 时前台默认 15 秒；background=true 不使用该默认值。超时会精确取消本次命令。",
+                "en": "Run commands inside a proot container and collect output. Default instance is Alpine: package manager is apk, not apt. Run `cat /etc/os-release` first, or call terminal_env once for the full picture. Preinstalled (no need to install): node, npm, pnpm, python3, uv, bash, busybox. Not preinstalled: curl, wget, git, ssh, gcc, make, cmake. Install per distribution: `apk add <pkg>` on Alpine, `apt-get install -y <pkg>` on Ubuntu/Debian, `dnf install -y <pkg>` on Fedora. Common commands: distribution `cat /etc/os-release`, installed package `apk info -e <pkg>`, list files `ls -la`, search content with grep, disk `df -h`, processes `ps aux`, extract `tar -xzf a.tar.gz` / `busybox unzip a.zip`. sdcard and storage are mounted, so Android storage is directly accessible. Working directory persists across commands. Strongly recommend passing timeoutMs explicitly. Do not use `set -e` or `set -o errexit`, which change shell exit behavior and can terminate the session with a failure. Without timeoutMs, foreground defaults to 15s; background=true does not use that default. Timeout cancels only this command."
             },
             "parameters": [
                 {
@@ -48,6 +48,14 @@ METADATA
                     "required": false
                 }
             ]
+        },
+        {
+            "name": "terminal_env",
+            "description": {
+                "zh": "探测当前终端实例的真实环境，返回发行版、包管理器、已安装与缺失的常用工具。安装任何软件前先调这个，避免在 Alpine 上用 apt 或重装已预装工具。返回结构：distro、packageManager、installCommand、installed（可直接用）、missing（需安装）、preinstalled（发行版自带，一般不必重装）。",
+                "en": "Probe the real environment of the current terminal instance: distribution, package manager, and which common tools are installed or missing. Call this before installing anything, to avoid using apt on Alpine or reinstalling preinstalled tools. Returns distro, packageManager, installCommand, installed (ready to use), missing (need install), preinstalled (shipped by the distro)."
+            },
+            "parameters": []
         },
         {
             "name": "terminal_wait",
@@ -306,8 +314,8 @@ const superAdmin = (function () {
         };
     }
     /**
-     * 在Ubuntu环境中执行终端命令并收集输出结果
-     * 运行环境：完整的Ubuntu系统，已正确挂载sdcard和storage目录
+     * 在 proot 容器中执行终端命令并收集输出结果（默认实例 Alpine，包管理器 apk）
+     * 运行环境：proot 容器，已正确挂载 sdcard 与 storage 目录
      * 禁止使用 set -e / set -o errexit 等会改变 shell 退出行为的命令，否则可能导致终端会话退出并卡死
      * @param command - 要执行的命令
      * @param background - 是否后台运行（"true" 为后台执行并立即返回，适合启动服务器等长时间运行任务，AI 不会收到该命令的输出结果）
@@ -566,10 +574,86 @@ const superAdmin = (function () {
             throw error;
         }
     }
+    /**
+     * 探测当前终端实例的真实环境。
+     *
+     * 为什么需要它：默认实例是 Alpine，包管理器是 apk；AI 若按 Ubuntu 习惯用 apt，
+     * 或者重装 node/python/uv 这些已预装工具，都会失败或浪费时间。
+     * 一次探测把事实交给 AI，比在每处 prompt 里写死发行版更可靠。
+     */
+    async function terminal_env(params) {
+        const probes = [
+            ['bash', 'command -v bash'],
+            ['curl', 'command -v curl'],
+            ['wget', 'command -v wget'],
+            ['git', 'command -v git'],
+            ['node', 'command -v node'],
+            ['npm', 'command -v npm'],
+            ['pnpm', 'command -v pnpm'],
+            ['python3', 'command -v python3'],
+            ['uv', 'command -v uv'],
+            ['gcc', 'command -v gcc'],
+            ['make', 'command -v make'],
+            ['cmake', 'command -v cmake'],
+            ['rustc', 'command -v rustc'],
+            ['cargo', 'command -v cargo'],
+            ['go', 'command -v go'],
+            ['java', 'command -v java'],
+            ['ssh', 'command -v ssh'],
+            ['tar', 'tar --help >/dev/null 2>&1'],
+            ['unzip', 'busybox unzip 2>&1 | grep -q Usage'],
+        ];
+        // 一次 shell 调用拿全部结果，避免逐个命令启动会话的开销。
+        const script = probes
+            .map(([name, cmd]) => `${cmd} >/dev/null 2>&1 && echo "${name}=1" || echo "${name}=0"`)
+            .join('; ');
+        const probeScript = `cat /etc/os-release 2>/dev/null | grep -E "^(ID|VERSION_ID)="; ${script}; command -v apk >/dev/null 2>&1 && echo "pm=apk" || (command -v apt-get >/dev/null 2>&1 && echo "pm=apt" || (command -v dnf >/dev/null 2>&1 && echo "pm=dnf" || echo "pm=unknown"))`;
+        try {
+            const result = await Tools.System.terminal.execute({ command: probeScript, timeoutMs: 30000 });
+            const output = String(result?.output ?? result ?? '');
+            const flags = {};
+            let distroId = '';
+            let versionId = '';
+            let packageManager = 'unknown';
+            output.split('\n').forEach((line) => {
+                const text = line.trim();
+                if (!text) return;
+                const eq = text.indexOf('=');
+                if (eq <= 0) return;
+                const key = text.slice(0, eq).trim();
+                const value = text.slice(eq + 1).trim().replace(/^"|"$/g, '');
+                if (key === 'ID') distroId = value;
+                else if (key === 'VERSION_ID') versionId = value;
+                else if (key === 'pm') packageManager = value;
+                else flags[key] = value === '1';
+            });
+            const installed = Object.keys(flags).filter((k) => flags[k]);
+            const missing = Object.keys(flags).filter((k) => !flags[k]);
+            const installCommand = packageManager === 'apk' ? 'apk add'
+                : packageManager === 'apt' ? 'apt-get install -y'
+                : packageManager === 'dnf' ? 'dnf install -y'
+                : null;
+            return {
+                distro: distroId || 'unknown',
+                version: versionId || '',
+                packageManager,
+                installCommand,
+                installed,
+                missing,
+                hint: installCommand
+                    ? `安装缺失工具用：${installCommand} <pkg>`
+                    : '未识别包管理器，请先用 cat /etc/os-release 确认发行版',
+            };
+        } catch (error) {
+            console.error('[terminal_env] 环境探测失败', error);
+            throw error;
+        }
+    }
     return {
         terminal,
         bash,
         terminal_wait,
+        terminal_env,
         terminal_start,
         terminal_poll,
         terminal_cancel,
@@ -580,6 +664,7 @@ const superAdmin = (function () {
 })();
 // 逐个导出
 exports.terminal = superAdmin.terminal;
+exports.terminal_env = superAdmin.terminal_env;
 exports.bash = superAdmin.bash;
 exports.terminal_wait = superAdmin.terminal_wait;
 exports.terminal_start = superAdmin.terminal_start;
