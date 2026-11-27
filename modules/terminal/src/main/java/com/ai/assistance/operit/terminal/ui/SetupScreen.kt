@@ -484,7 +484,7 @@ fun SetupScreen(
                     }
 
                     if (packagesToInstall.isNotEmpty()) {
-                        commands.add(tool.installCommand(packagesToInstall.distinct()))
+                        commands.add(tool.installCommand(packagesToInstall.distinct()).joinToString(" "))
                     }
 
                     if (selectedCustomCommands.isNotEmpty()) {
