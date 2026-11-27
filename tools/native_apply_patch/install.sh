@@ -20,7 +20,7 @@ if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
 fi
 
 # 在修改已安装命令前验证来源，校验失败立即终止本次登录。
-printf '%s  %s\n' "$expected_sha" "$payload" | sha256sum --check --status
+printf '%s  %s\n' "$expected_sha" "$payload" | sha256sum -c -s
 mkdir -p -- "$command_dir"
 lock_file="$command_dir/.operit-apply-patch.install.lock"
 exec 9>"$lock_file"
@@ -36,7 +36,7 @@ set_host_owner "$lock_file"
 
 destination="$command_dir/apply_patch"
 if [ -f "$destination" ] && [ ! -L "$destination" ] &&
-    printf '%s  %s\n' "$expected_sha" "$destination" | sha256sum --check --status; then
+    printf '%s  %s\n' "$expected_sha" "$destination" | sha256sum -c -s; then
     set_host_owner "$destination"
     chmod 0755 -- "$destination"
     exit 0
@@ -46,7 +46,7 @@ fi
 staging=$(mktemp "$command_dir/.apply_patch.XXXXXXXX")
 trap 'rm -f -- "$staging"' EXIT
 cp -- "$payload" "$staging"
-printf '%s  %s\n' "$expected_sha" "$staging" | sha256sum --check --status
+printf '%s  %s\n' "$expected_sha" "$staging" | sha256sum -c -s
 set_host_owner "$staging"
 chmod 0755 -- "$staging"
 mv --force --no-target-directory -- "$staging" "$destination"
