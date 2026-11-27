@@ -308,3 +308,59 @@ mod tag_name_tests {
         assert_eq!(opening_tag_name("<tool nam"), Some("tool"));
     }
 }
+
+/// 判断一段 XML 片段是否已经完整闭合。
+///
+/// 与 Kotlin 侧 isXmlFullyClosed 同语义：自闭合、或存在对应 </tag>。
+/// 流式渲染每帧都会对每个节点调用，Rust 侧一次扫描替代两次 String 分配。
+pub fn is_fully_closed(xml: &str) -> bool {
+    let trimmed = xml.trim();
+    if trimmed.ends_with("/>") {
+        return true;
+    }
+    let tag = match opening_tag_name(xml) {
+        Some(v) => v,
+        None => return false,
+    };
+    let closing = format!("</{}>", tag);
+    trimmed.contains(&closing)
+}
+
+/// is_fully_closed 的 JNI 入口。true 返回 1，false 返回 0。
+#[no_mangle]
+pub extern "system" fn Java_com_ai_assistance_operit_ui_common_markdown_NativeXmlGroup_isFullyClosedJni(
+    mut env: JNIEnv,
+    _class: JClass,
+    xml: JString,
+) -> jboolean {
+    let text: String = match env.get_string(&xml) {
+        Ok(v) => v.into(),
+        Err(_) => return 0,
+    };
+    if is_fully_closed(&text) { 1 } else { 0 }
+}
+
+#[cfg(test)]
+mod closed_tests {
+    use super::is_fully_closed;
+
+    #[test]
+    fn self_closing() {
+        assert!(is_fully_closed("<tool name=\"a\"/>"));
+    }
+
+    #[test]
+    fn closed_pair() {
+        assert!(is_fully_closed("<think>x</think>"));
+    }
+
+    #[test]
+    fn streaming_incomplete() {
+        assert!(!is_fully_closed("<tool name=\"a\">"));
+    }
+
+    #[test]
+    fn not_xml() {
+        assert!(!is_fully_closed("plain text"));
+    }
+}
