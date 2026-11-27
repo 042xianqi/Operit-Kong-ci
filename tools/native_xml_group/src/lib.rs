@@ -221,3 +221,90 @@ pub extern "system" fn Java_com_ai_assistance_operit_ui_common_markdown_NativeXm
         .map(|v| v.into_raw())
         .unwrap_or(std::ptr::null_mut())
 }
+
+/// 从 XML 片段里取首标签名，与 Kotlin `ChatMarkupRegex.extractOpeningTagName` 同语义。
+///
+/// 流式渲染时每个节点、每一帧都会调用它（ThinkToolsXmlNodeGrouper 的
+/// slice.count / when(extractXmlTagName(...))）。Kotlin 侧走 java.util.regex，
+/// 每次都要分配 Matcher；这里只用一次线性扫描，不产生中间对象。
+#[no_mangle]
+pub extern "system" fn Java_com_ai_assistance_operit_ui_common_markdown_NativeXmlGroup_tagNameJni(
+    mut env: JNIEnv,
+    _class: JClass,
+    xml: JString,
+) -> jstring {
+    let text: String = match env.get_string(&xml) {
+        Ok(v) => v.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match opening_tag_name(&text) {
+        Some(name) => match env.new_string(name) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// 纯函数版本，不依赖 JNI，方便单元测试。
+///
+/// 与 Kotlin 正则 `<([A-Za-z][A-Za-z0-9_]*)` 逐条对齐：
+///   - 跳过第一个 '<' 之前的所有字符
+///   - '<' 之后必须是 ASCII 字母
+///   - 随后接受字母、数字、下划线
+///   - 不匹配返回 None
+pub fn opening_tag_name(xml: &str) -> Option<&str> {
+    let bytes = xml.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i] != b'<' {
+        i += 1;
+    }
+    i += 1;
+    if i >= bytes.len() {
+        return None;
+    }
+    let start = i;
+    if !bytes[i].is_ascii_alphabetic() {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    xml.get(start..i)
+}
+
+#[cfg(test)]
+mod tag_name_tests {
+    use super::opening_tag_name;
+
+    #[test]
+    fn simple_tool_tag() {
+        assert_eq!(opening_tag_name("<tool name=\"a\">"), Some("tool"));
+    }
+
+    #[test]
+    fn tool_result_tag() {
+        assert_eq!(opening_tag_name("<tool_result>"), Some("tool_result"));
+    }
+
+    #[test]
+    fn leading_whitespace() {
+        assert_eq!(opening_tag_name("  \n  <think>"), Some("think"));
+    }
+
+    #[test]
+    fn closing_only_is_none() {
+        assert_eq!(opening_tag_name("</tool>"), None);
+    }
+
+    #[test]
+    fn plain_text_is_none() {
+        assert_eq!(opening_tag_name("hello"), None);
+    }
+
+    #[test]
+    fn unterminated_streaming() {
+        assert_eq!(opening_tag_name("<tool nam"), Some("tool"));
+    }
+}
