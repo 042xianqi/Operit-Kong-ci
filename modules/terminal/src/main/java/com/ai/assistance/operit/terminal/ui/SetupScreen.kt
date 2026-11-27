@@ -48,8 +48,14 @@ data class PackageItem(
     val id: String,
     val name: String,
     val command: String,
-    val description: String = ""
-)
+    val description: String = "",
+    val alpinePackage: String = "",
+    val preinstalled: Boolean = false,
+) {
+    /** 按当前包管理器取实际包名。 */
+    fun packageNameFor(tool: PackageTool): String =
+        if (tool == PackageTool.APK && alpinePackage.isNotEmpty()) alpinePackage else command
+}
 
 data class PackageCategory(
     val id: String,
@@ -80,60 +86,110 @@ fun SetupScreen(
         derivedStateOf {
             listOf(
                 PackageCategory(
-                    id = "nodejs",
-                    name = context.getString(com.ai.assistance.operit.terminal.R.string.category_nodejs_name),
-                    description = context.getString(com.ai.assistance.operit.terminal.R.string.category_nodejs_desc),
+                    id = "base",
+                    name = "基础工具",
+                    description = "下载、版本控制、解压，几乎所有场景都需要",
                     packages = listOf(
-                        PackageItem("nodejs", context.getString(com.ai.assistance.operit.terminal.R.string.package_nodejs_name), "curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && apt install -y nodejs", context.getString(com.ai.assistance.operit.terminal.R.string.package_nodejs_desc)),
-                        PackageItem("pnpm", context.getString(com.ai.assistance.operit.terminal.R.string.package_pnpm_name), "typescript", context.getString(com.ai.assistance.operit.terminal.R.string.package_pnpm_desc))
+                        PackageItem("curl", "curl", "curl", "命令行下载，Rust/Node 安装脚本的前置依赖", alpinePackage = "curl"),
+                        PackageItem("wget", "wget", "wget", "另一个下载工具，部分脚本只认 wget", alpinePackage = "wget"),
+                        PackageItem("git", "git", "git", "版本控制，克隆仓库必需", alpinePackage = "git"),
+                        PackageItem("tar", "tar", "tar", "解压 tar.gz 与 tar.zst", alpinePackage = "tar"),
+                        PackageItem("tar", "tar", "tar", "解压 tar.gz，Alpine 由 busybox 提供", alpinePackage = "tar", preinstalled = true),
+                        PackageItem("unzip", "unzip", "unzip", "解压 zip，Alpine 由 busybox 提供", alpinePackage = "unzip", preinstalled = true),
+                    )
+                ),
+                PackageCategory(
+                    id = "build",
+                    name = "编译工具链",
+                    description = "编译 C/C++/Rust 原生库的最小集合",
+                    packages = listOf(
+                        PackageItem("gcc", "GCC", "build-essential", "C 编译器与链接器", alpinePackage = "gcc"),
+                        PackageItem("gpp", "G++", "g++", "C++ 编译器", alpinePackage = "g++"),
+                        PackageItem("make", "make", "make", "构建工具", alpinePackage = "make"),
+                        PackageItem("cmake", "CMake", "cmake", "跨平台构建系统", alpinePackage = "cmake"),
+                        PackageItem("ninja", "Ninja", "ninja-build", "更快的构建后端", alpinePackage = "ninja"),
+                        PackageItem("musldev", "C 头文件", "libc6-dev", "编译原生库需要的系统头文件", alpinePackage = "musl-dev"),
                     )
                 ),
                 PackageCategory(
                     id = "python",
-                    name = context.getString(com.ai.assistance.operit.terminal.R.string.category_python_name),
-                    description = context.getString(com.ai.assistance.operit.terminal.R.string.category_python_desc),
+                    name = "Python",
+                    description = "内置 Alpine 已带 python3.12 与 uv",
                     packages = listOf(
-                        PackageItem("python-is-python3", context.getString(com.ai.assistance.operit.terminal.R.string.package_python_link_name), "python-is-python3", context.getString(com.ai.assistance.operit.terminal.R.string.package_python_link_desc)),
-                        PackageItem("python3-venv", context.getString(com.ai.assistance.operit.terminal.R.string.package_python_venv_name), "python3-venv", context.getString(com.ai.assistance.operit.terminal.R.string.package_python_venv_desc)),
-                        PackageItem("python3-pip", context.getString(com.ai.assistance.operit.terminal.R.string.package_python_pip_name), "python3-pip", context.getString(com.ai.assistance.operit.terminal.R.string.package_python_pip_desc)),
-                        PackageItem("uv", context.getString(com.ai.assistance.operit.terminal.R.string.package_uv_name), "pipx install uv", context.getString(com.ai.assistance.operit.terminal.R.string.package_uv_desc))
+                        PackageItem("python3", "Python 3", "python3", "解释器本身", alpinePackage = "python3", preinstalled = true),
+                        PackageItem("pip", "pip", "python3-pip", "包安装器", alpinePackage = "py3-pip"),
+                        PackageItem("venv", "venv", "python3-venv", "虚拟环境", alpinePackage = "py3-virtualenv"),
+                        PackageItem("uv", "uv", "pipx install uv", "极快的 Python 包管理器", alpinePackage = "uv", preinstalled = true),
                     )
                 ),
                 PackageCategory(
-                    id = "ssh",
-                    name = context.getString(com.ai.assistance.operit.terminal.R.string.category_ssh_name),
-                    description = context.getString(com.ai.assistance.operit.terminal.R.string.category_ssh_desc),
+                    id = "nodejs",
+                    name = "Node.js",
+                    description = "内置 Alpine 已带 nodejs/npm/pnpm",
                     packages = listOf(
-                        PackageItem("ssh", context.getString(com.ai.assistance.operit.terminal.R.string.package_ssh_client_name), "ssh", context.getString(com.ai.assistance.operit.terminal.R.string.package_ssh_client_desc)),
-                        PackageItem("sshpass", context.getString(com.ai.assistance.operit.terminal.R.string.package_sshpass_name), "sshpass", context.getString(com.ai.assistance.operit.terminal.R.string.package_sshpass_desc)),
-                        PackageItem("openssh-server", "OpenSSH 服务器", "openssh-server", "用于反向隧道挂载本地文件系统")
-                    )
-                ),
-                PackageCategory(
-                    id = "java", 
-                    name = context.getString(com.ai.assistance.operit.terminal.R.string.category_java_name),
-                    description = context.getString(com.ai.assistance.operit.terminal.R.string.category_java_desc),
-                    packages = listOf(
-                        PackageItem("openjdk-17", context.getString(com.ai.assistance.operit.terminal.R.string.package_openjdk_name), "openjdk-17-jdk", context.getString(com.ai.assistance.operit.terminal.R.string.package_openjdk_desc)),
-                        PackageItem("gradle", context.getString(com.ai.assistance.operit.terminal.R.string.package_gradle_name), "gradle", context.getString(com.ai.assistance.operit.terminal.R.string.package_gradle_desc))
+                        PackageItem("nodejs", "Node.js", "nodejs", "运行时", alpinePackage = "nodejs", preinstalled = true),
+                        PackageItem("npm", "npm", "npm", "包管理器", alpinePackage = "npm", preinstalled = true),
+                        PackageItem("pnpm", "pnpm", "pnpm", "更省磁盘的包管理器", alpinePackage = "pnpm", preinstalled = true),
+                        PackageItem("typescript", "TypeScript", "typescript", "类型系统编译到 JS", alpinePackage = ""),
                     )
                 ),
                 PackageCategory(
                     id = "rust",
-                    name = context.getString(com.ai.assistance.operit.terminal.R.string.category_rust_name),
-                    description = context.getString(com.ai.assistance.operit.terminal.R.string.category_rust_desc),
+                    name = "Rust",
+                    description = "编译 Rust 项目，本工程的 native 库需要",
                     packages = listOf(
-                        PackageItem("rust", context.getString(com.ai.assistance.operit.terminal.R.string.package_rust_name), "RUST_INSTALL_COMMAND", context.getString(com.ai.assistance.operit.terminal.R.string.package_rust_desc))
+                        PackageItem("rust", "rustup", "RUST_INSTALL_COMMAND", "Rust 工具链安装器", alpinePackage = "rust"),
+                        PackageItem("cargo", "cargo", "cargo", "Rust 包管理器", alpinePackage = "cargo"),
                     )
                 ),
                 PackageCategory(
                     id = "go",
-                    name = context.getString(com.ai.assistance.operit.terminal.R.string.category_go_name),
-                    description = context.getString(com.ai.assistance.operit.terminal.R.string.category_go_desc),
+                    name = "Go",
+                    description = "编译 Go 项目",
                     packages = listOf(
-                        PackageItem("go", context.getString(com.ai.assistance.operit.terminal.R.string.package_go_name), "golang-go", context.getString(com.ai.assistance.operit.terminal.R.string.package_go_desc))
+                        PackageItem("go", "Go", "golang-go", "Go 工具链", alpinePackage = "go"),
                     )
-                )
+                ),
+                PackageCategory(
+                    id = "java",
+                    name = "Java",
+                    description = "编译与运行 JVM 项目",
+                    packages = listOf(
+                        PackageItem("jdk17", "OpenJDK 17", "openjdk-17-jdk", "JDK", alpinePackage = "openjdk17"),
+                        PackageItem("gradle", "Gradle", "gradle", "构建工具", alpinePackage = "gradle"),
+                    )
+                ),
+                PackageCategory(
+                    id = "ssh",
+                    name = "SSH",
+                    description = "远程连接与反向隧道",
+                    packages = listOf(
+                        PackageItem("ssh", "SSH 客户端", "ssh", "远程登录", alpinePackage = "openssh-client"),
+                        PackageItem("sshpass", "sshpass", "sshpass", "非交互提供密码", alpinePackage = "sshpass"),
+                        PackageItem("sshd", "OpenSSH 服务器", "openssh-server", "反向隧道挂载本地文件", alpinePackage = "openssh"),
+                    )
+                ),
+                PackageCategory(
+                    id = "search",
+                    name = "搜索与查看",
+                    description = "代码检索与文件浏览",
+                    packages = listOf(
+                        PackageItem("ripgrep", "ripgrep", "ripgrep", "内容搜索，比 grep 快", alpinePackage = "ripgrep"),
+                        PackageItem("fd", "fd", "fd-find", "文件名搜索", alpinePackage = "fd"),
+                        PackageItem("fzf", "fzf", "fzf", "模糊查找", alpinePackage = "fzf"),
+                        PackageItem("vim", "vim", "vim", "终端编辑器", alpinePackage = "vim"),
+                        PackageItem("tmux", "tmux", "tmux", "会话保持与分屏", alpinePackage = "tmux"),
+                    )
+                ),
+                PackageCategory(
+                    id = "media",
+                    name = "媒体处理",
+                    description = "音视频与图片",
+                    packages = listOf(
+                        PackageItem("ffmpeg", "FFmpeg", "ffmpeg", "音视频转码", alpinePackage = "ffmpeg"),
+                        PackageItem("imagemagick", "ImageMagick", "imagemagick", "图片转换", alpinePackage = "imagemagick"),
+                    )
+                ),
             )
         }
     }
@@ -350,100 +406,100 @@ fun SetupScreen(
             
             Button(
                 onClick = {
+                    val tool = activeTool
                     val commands = mutableListOf<String>()
-                    
-                    // 先刷新索引并补齐依赖，避免 dpkg 提前失败导致后续修复命令被 && 跳过。
-                    commands.add("apt-get update")
-                    commands.add("apt-get --fix-broken install -y")
-                    commands.add("dpkg --configure -a")
 
-                    // 系统升级
-                    commands.add("apt upgrade -y")
-                    
-                    // 为 pip/pipx 设置国内镜像（永久配置）
+                    // 包管理器不同，索引刷新命令也不同。
+                    when (tool) {
+                        PackageTool.APK -> {
+                            commands.add("apk update")
+                        }
+                        PackageTool.APT -> {
+                            commands.add("apt-get update")
+                            commands.add("apt-get --fix-broken install -y")
+                            commands.add("dpkg --configure -a")
+                            commands.add("apt upgrade -y")
+                        }
+                        PackageTool.DNF -> {
+                            commands.add("dnf makecache")
+                        }
+                    }
+
+                    // 为 pip / uv 设置国内镜像，永久生效。
                     commands.add("mkdir -p ~/.config/pip")
                     commands.add("echo '[global]' > ~/.config/pip/pip.conf")
                     commands.add("echo 'index-url = https://pypi.tuna.tsinghua.edu.cn/simple' >> ~/.config/pip/pip.conf")
-                    
-                    // 为 uv/uvx 设置国内镜像（永久配置）
                     commands.add("mkdir -p ~/.config/uv")
                     commands.add("echo 'index-url = \"https://pypi.tuna.tsinghua.edu.cn/simple\"' > ~/.config/uv/uv.toml")
-                    
-                    // 收集选中的包
-                    val selectedAptPackages = mutableListOf<String>()
+
+                    val packagesToInstall = mutableListOf<String>()
                     val selectedNpmPackages = mutableListOf<String>()
                     val selectedCustomCommands = mutableListOf<String>()
-                    
+
                     packageCategories.forEach { category ->
                         category.packages.forEach { pkg ->
-                            if (selectedPackages[pkg.id] == true && packageStatus[pkg.id] != InstallStatus.INSTALLED) {
-                                // 根据分类和包ID判断包管理器
-                                if (pkg.id == "rust") {
-                                    // 获取当前选择的Rust镜像源
+                            if (selectedPackages[pkg.id] != true) return@forEach
+                            if (packageStatus[pkg.id] == InstallStatus.INSTALLED) return@forEach
+                            when {
+                                pkg.id == "rust" -> {
                                     val rustSource = sourceManager.getSelectedSource(PackageManagerType.RUST)
                                     val rustEnvCommand = sourceManager.getRustSourceEnvCommand(rustSource)
-                                    // 添加环境变量设置和安装命令
                                     selectedCustomCommands.add("$rustEnvCommand && curl -v --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
-                                } else if (pkg.id == "uv" || pkg.id == "nodejs") {
-                                    selectedCustomCommands.add(pkg.command)
-                                } else if (category.id == "nodejs" && pkg.id != "nodejs") {
+                                }
+                                pkg.id == "uv" -> {
+                                    val uvCommand = if (tool == PackageTool.APK) {
+                                        "pip3 install --break-system-packages uv"
+                                    } else {
+                                        "pipx install uv"
+                                    }
+                                    selectedCustomCommands.add(uvCommand)
+                                }
+                                category.id == "nodejs" && pkg.id != "nodejs" -> {
                                     selectedNpmPackages.add(pkg.command)
-                                } else {
-                                    selectedAptPackages.add(pkg.command)
+                                }
+                                else -> {
+                                    packagesToInstall.add(pkg.packageNameFor(tool))
                                 }
                             }
                         }
                     }
 
-                    // 添加 pipx 作为 uv 的依赖
-                    if (selectedPackages.getOrDefault("uv", false) && packageStatus["uv"] != InstallStatus.INSTALLED) {
-                        selectedAptPackages.add("pipx")
+                    // rustup 需要 curl 与 C 工具链；Alpine 没有 build-essential。
+                    if (selectedPackages.getOrDefault("rust", false) && packageStatus["rust"] != InstallStatus.INSTALLED) {
+                        if (tool == PackageTool.APK) {
+                            packagesToInstall.add("curl")
+                            packagesToInstall.add("bash")
+                            packagesToInstall.add("build-base")
+                        } else {
+                            packagesToInstall.add("curl")
+                            packagesToInstall.add("build-essential")
+                        }
+                    }
+                    // uv 在 APT 下依赖 pipx。
+                    if (selectedPackages.getOrDefault("uv", false) &&
+                        packageStatus["uv"] != InstallStatus.INSTALLED &&
+                        tool == PackageTool.APT
+                    ) {
+                        packagesToInstall.add("pipx")
                     }
 
-                    // 首先安装所有依赖包
-                    val allAptDeps = mutableSetOf<String>()
-                    
-                    // 添加自定义命令的依赖
-                    if (selectedCustomCommands.isNotEmpty()) {
-                        if (selectedPackages.getOrDefault("rust", false)) {
-                            allAptDeps.add("curl")
-                            allAptDeps.add("build-essential")
-                        }
-                        if (selectedPackages.getOrDefault("nodejs", false)) {
-                            allAptDeps.add("curl")
-                        }
+                    if (packagesToInstall.isNotEmpty()) {
+                        commands.add(tool.installCommand(packagesToInstall.distinct()))
                     }
-                    
-                    // 添加选中的 apt 包
-                    allAptDeps.addAll(selectedAptPackages)
-                    
-                    // 使用 apt 安装所有 apt 包和依赖
-                    if (allAptDeps.isNotEmpty()) {
-                        commands.add("apt install -y ${allAptDeps.joinToString(" ")}")
-                    }
-                    
-                    // 然后运行自定义命令（如安装 rust, uv, nodejs 等）
+
                     if (selectedCustomCommands.isNotEmpty()) {
                         commands.addAll(selectedCustomCommands)
-
-                        // 如果安装了 uv，则需要确保 pipx 路径可用
-                        if (selectedPackages.getOrDefault("uv", false)) {
+                        if (selectedPackages.getOrDefault("uv", false) && tool == PackageTool.APT) {
                             commands.add("pipx ensurepath")
-                            commands.add("source ~/.profile")
                         }
                     }
-                    
-                    // 安装 NPM 包（如果 nodejs 已经安装或被选中）
+
                     if (selectedNpmPackages.isNotEmpty()) {
-                        // 更换为淘宝源
                         commands.add("npm config set registry https://registry.npmmirror.com/")
-                        // 清理 npm 缓存
                         commands.add("npm cache clean --force")
-                        // 安装pnpm
-                        commands.add("npm install -g pnpm")
-                        // 使用 pnpm 安装其他包
                         commands.add("pnpm add -g ${selectedNpmPackages.joinToString(" ")}")
                     }
+
                     
                     commandsToRun.value = commands
                     showSetupDialog = true
@@ -646,36 +702,32 @@ private suspend fun checkPackageInstalled(
     scope: CoroutineScope,
     tool: PackageTool
 ): Boolean {
-    val command: String = when (pkg.id) {
-        "rust" -> "command -v rustc"
+    // apk info -e 对已装包输出包名，对缺失包没有任何输出但 rc=1。
+    // 只看文本会把缺失误判成已装，因此统一以退出码为准。
+    val probe: String = when (pkg.id) {
+        "rust" -> "command -v rustc || test -x ~/.cargo/bin/rustc"
         "uv" -> "command -v uv"
-        "nodejs" -> "node -v 2>/dev/null"
-        "pnpm" -> "test -f \"\$(npm prefix -g)/bin/pnpm\" && echo FOUND_PNPM"
+        "nodejs" -> "command -v node"
+        "npm" -> "command -v npm"
+        "pnpm" -> "command -v pnpm"
+        "typescript" -> "command -v tsc"
         "go" -> "command -v go"
         "ssh" -> "command -v ssh"
         "sshpass" -> "command -v sshpass"
-        "openssh-server" -> "command -v sshd"
+        "sshd" -> "command -v sshd || test -x /usr/sbin/sshd"
         "gradle" -> "command -v gradle"
-        // 不能写死 dpkg：默认实例的包管理器是 apk，dpkg 不存在。
-        else -> tool.queryCommand(pkg.command.split(" ").first()).joinToString(" "),
+        "cargo" -> "command -v cargo"
+        "pip" -> "command -v pip3 || command -v pip"
+        else -> tool.queryCommand(pkg.packageNameFor(tool)).joinToString(" ")
     }
-
+    val marker = "OPERIT_PROBE_RC="
+    val command = "{ " + probe + " ; } 2>&1; echo " + marker + "\$?"
     val output = executeCommandAndGetOutput(terminalManager, sessionId, command, scope)
-    if (output == null) return false // 超时或错误
-
-    return when (pkg.id) {
-        "nodejs" -> {
-            // 检查 Node.js 版本是否 >= 24
-            if (output.isBlank() || output.contains("not found")) return false
-            val versionMatch = Regex("""v(\d+)\..*""").find(output.trim())
-            val majorVersion = versionMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-            majorVersion >= 24
-        }
-        "rust", "uv", "go", "ssh", "sshpass", "openssh-server", "gradle" -> output.isNotBlank() && !output.contains("not found")
-        "pnpm" -> output.contains("FOUND_PNPM")
-        // dpkg -s 成功时含 Status: install ok installed；apk info -e 成功时无输出但 exit 0。
-        else -> !output.contains("not found")
-    }
+        ?: return false
+    val rc = output.substringAfterLast(marker, "")
+        .takeWhile { it.isDigit() }
+        .toIntOrNull() ?: return false
+    return rc == 0
 }
 
 @RequiresApi(Build.VERSION_CODES.O)
