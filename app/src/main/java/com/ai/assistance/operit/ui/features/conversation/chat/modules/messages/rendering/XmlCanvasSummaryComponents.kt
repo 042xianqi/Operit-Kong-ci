@@ -128,11 +128,13 @@ internal fun CanvasToolSummaryRow(
             modifier = Modifier.size(TOOL_ROW_ICON_SIZE),
         )
         Spacer(modifier = Modifier.width(TOOL_ROW_ICON_GAP))
+        // 工具名占据自己的列：多个工具行叠在一起时，右侧的状态标记能够对齐成一条竖线。
         Text(
             text = toolName,
             style = textStyle,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false),
         )
         if (trailingText.isNotEmpty()) {
             Spacer(modifier = Modifier.width(TOOL_ROW_ICON_GAP))
@@ -141,7 +143,7 @@ internal fun CanvasToolSummaryRow(
                 style = textStyle,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(2f),
             )
         } else if (summary.isNotEmpty()) {
             Spacer(modifier = Modifier.width(TOOL_ROW_ICON_GAP))
@@ -150,7 +152,7 @@ internal fun CanvasToolSummaryRow(
                 style = textStyle,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(2f),
             )
         } else {
             Spacer(modifier = Modifier.weight(1f))
@@ -171,7 +173,7 @@ internal fun CanvasToolSummaryRow(
             Icon(
                 imageVector = if (isSuccess) Icons.Filled.Check else Icons.Filled.ErrorOutline,
                 contentDescription = statusText,
-                tint = rowColor,
+                tint = if (isSuccess) rowColor else MaterialTheme.colorScheme.error,
                 modifier = Modifier.size(TOOL_ROW_STATUS_SIZE),
             )
         }
@@ -190,9 +192,9 @@ internal fun CanvasToolSummaryRow(
 
 /** Operit2 `ChatActivityRowStyle`：iconSize 16 / iconGap 8 / headerPadding vertical 5。 */
 private val TOOL_ROW_ICON_SIZE = 16.dp
-private val TOOL_ROW_ICON_GAP = 8.dp
+private val TOOL_ROW_ICON_GAP = 6.dp
 private val TOOL_ROW_STATUS_SIZE = 14.dp
-private val TOOL_ROW_CURSOR_GAP = 6.dp
+private val TOOL_ROW_CURSOR_GAP = 4.dp
 
 private fun String.toCanvasSingleLineText(): String {
     val normalized = replace('\r', ' ').replace('\n', ' ').trim()
