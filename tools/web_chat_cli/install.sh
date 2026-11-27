@@ -15,7 +15,7 @@ case "$command_dir" in
 esac
 [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || { echo 'web-chat 校验值无效' >&2; exit 2; }
 [[ "$socket_name" =~ ^operit\.web-chat\.[0-9]+$ ]] || { echo 'web-chat 通道名称无效' >&2; exit 2; }
-printf '%s  %s\n' "$expected_sha" "$payload" | sha256sum --check --status
+printf '%s  %s\n' "$expected_sha" "$payload" | sha256sum -c -s
 mkdir -p -- "$command_dir"
 lock_file="$command_dir/.operit-web-chat.install.lock"
 exec 9>"$lock_file"
@@ -30,9 +30,9 @@ destination="$command_dir/.web-chat-bin-$expected_sha"
 staging=$(mktemp "$command_dir/.web-chat-install.XXXXXXXX")
 trap 'rm -f -- "$staging"' EXIT
 if [ ! -f "$destination" ] || [ -L "$destination" ] ||
-    ! printf '%s  %s\n' "$expected_sha" "$destination" | sha256sum --check --status; then
+    ! printf '%s  %s\n' "$expected_sha" "$destination" | sha256sum -c -s; then
     cp -- "$payload" "$staging"
-    printf '%s  %s\n' "$expected_sha" "$staging" | sha256sum --check --status
+    printf '%s  %s\n' "$expected_sha" "$staging" | sha256sum -c -s
     set_host_owner "$staging"
     chmod 0755 -- "$staging"
     mv --force --no-target-directory -- "$staging" "$destination"
