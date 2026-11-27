@@ -306,8 +306,8 @@ const superAdmin = (function () {
         };
     }
     /**
-     * 在Ubuntu环境中执行终端命令并收集输出结果
-     * 运行环境：完整的Ubuntu系统，已正确挂载sdcard和storage目录
+     * 在 proot 容器中执行终端命令并收集输出结果（默认实例 Alpine，包管理器 apk）
+     * 运行环境：proot 容器，已正确挂载 sdcard 与 storage 目录
      * 禁止使用 set -e / set -o errexit 等会改变 shell 退出行为的命令，否则可能导致终端会话退出并卡死
      * @param command - 要执行的命令
      * @param background - 是否后台运行（"true" 为后台执行并立即返回，适合启动服务器等长时间运行任务，AI 不会收到该命令的输出结果）
