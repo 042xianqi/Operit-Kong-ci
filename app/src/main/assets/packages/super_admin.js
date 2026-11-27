@@ -50,6 +50,14 @@ METADATA
             ]
         },
         {
+            "name": "terminal_env",
+            "description": {
+                "zh": "探测当前终端实例的真实环境，返回发行版、包管理器、已安装与缺失的常用工具。安装任何软件前先调这个，避免在 Alpine 上用 apt 或重装已预装工具。返回结构：distro、packageManager、installCommand、installed（可直接用）、missing（需安装）、preinstalled（发行版自带，一般不必重装）。",
+                "en": "Probe the real environment of the current terminal instance: distribution, package manager, and which common tools are installed or missing. Call this before installing anything, to avoid using apt on Alpine or reinstalling preinstalled tools. Returns distro, packageManager, installCommand, installed (ready to use), missing (need install), preinstalled (shipped by the distro)."
+            },
+            "parameters": []
+        },
+        {
             "name": "terminal_wait",
             "description": {
                 "zh": "等待同一终端会话中的上一条命令执行完成。与 sleep 不同，本工具会在命令实际完成时提前返回，而不是固定睡眠。超时时仅取消本次排队等待；使用 terminal_poll 等待托管任务不会取消任务。",
@@ -566,10 +574,86 @@ const superAdmin = (function () {
             throw error;
         }
     }
+    /**
+     * 探测当前终端实例的真实环境。
+     *
+     * 为什么需要它：默认实例是 Alpine，包管理器是 apk；AI 若按 Ubuntu 习惯用 apt，
+     * 或者重装 node/python/uv 这些已预装工具，都会失败或浪费时间。
+     * 一次探测把事实交给 AI，比在每处 prompt 里写死发行版更可靠。
+     */
+    async function terminal_env(params) {
+        const probes = [
+            ['bash', 'command -v bash'],
+            ['curl', 'command -v curl'],
+            ['wget', 'command -v wget'],
+            ['git', 'command -v git'],
+            ['node', 'command -v node'],
+            ['npm', 'command -v npm'],
+            ['pnpm', 'command -v pnpm'],
+            ['python3', 'command -v python3'],
+            ['uv', 'command -v uv'],
+            ['gcc', 'command -v gcc'],
+            ['make', 'command -v make'],
+            ['cmake', 'command -v cmake'],
+            ['rustc', 'command -v rustc'],
+            ['cargo', 'command -v cargo'],
+            ['go', 'command -v go'],
+            ['java', 'command -v java'],
+            ['ssh', 'command -v ssh'],
+            ['tar', 'tar --help >/dev/null 2>&1'],
+            ['unzip', 'busybox unzip 2>&1 | grep -q Usage'],
+        ];
+        // 一次 shell 调用拿全部结果，避免逐个命令启动会话的开销。
+        const script = probes
+            .map(([name, cmd]) => `${cmd} >/dev/null 2>&1 && echo "${name}=1" || echo "${name}=0"`)
+            .join('; ');
+        const probeScript = `cat /etc/os-release 2>/dev/null | grep -E "^(ID|VERSION_ID)="; ${script}; command -v apk >/dev/null 2>&1 && echo "pm=apk" || (command -v apt-get >/dev/null 2>&1 && echo "pm=apt" || (command -v dnf >/dev/null 2>&1 && echo "pm=dnf" || echo "pm=unknown"))`;
+        try {
+            const result = await Tools.System.terminal.execute({ command: probeScript, timeoutMs: 30000 });
+            const output = String(result?.output ?? result ?? '');
+            const flags = {};
+            let distroId = '';
+            let versionId = '';
+            let packageManager = 'unknown';
+            output.split('\n').forEach((line) => {
+                const text = line.trim();
+                if (!text) return;
+                const eq = text.indexOf('=');
+                if (eq <= 0) return;
+                const key = text.slice(0, eq).trim();
+                const value = text.slice(eq + 1).trim().replace(/^"|"$/g, '');
+                if (key === 'ID') distroId = value;
+                else if (key === 'VERSION_ID') versionId = value;
+                else if (key === 'pm') packageManager = value;
+                else flags[key] = value === '1';
+            });
+            const installed = Object.keys(flags).filter((k) => flags[k]);
+            const missing = Object.keys(flags).filter((k) => !flags[k]);
+            const installCommand = packageManager === 'apk' ? 'apk add'
+                : packageManager === 'apt' ? 'apt-get install -y'
+                : packageManager === 'dnf' ? 'dnf install -y'
+                : null;
+            return {
+                distro: distroId || 'unknown',
+                version: versionId || '',
+                packageManager,
+                installCommand,
+                installed,
+                missing,
+                hint: installCommand
+                    ? `安装缺失工具用：${installCommand} <pkg>`
+                    : '未识别包管理器，请先用 cat /etc/os-release 确认发行版',
+            };
+        } catch (error) {
+            console.error('[terminal_env] 环境探测失败', error);
+            throw error;
+        }
+    }
     return {
         terminal,
         bash,
         terminal_wait,
+        terminal_env,
         terminal_start,
         terminal_poll,
         terminal_cancel,
@@ -580,6 +664,7 @@ const superAdmin = (function () {
 })();
 // 逐个导出
 exports.terminal = superAdmin.terminal;
+exports.terminal_env = superAdmin.terminal_env;
 exports.bash = superAdmin.bash;
 exports.terminal_wait = superAdmin.terminal_wait;
 exports.terminal_start = superAdmin.terminal_start;
