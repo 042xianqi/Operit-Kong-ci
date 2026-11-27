@@ -1,0 +1,49 @@
+# Terminal Core Module
+
+This is a standalone Android module that provides the core functionality for the `Operit Terminal` application. It is designed as a reusable component, exposing its features through a centralized `TerminalManager` and a corresponding AIDL interface for inter-process communication.
+
+## Module Responsibilities
+
+The `terminal-core` module is responsible for the following core tasks:
+
+-   **Session Management**: Creating, switching, and closing multiple independent terminal sessions.
+-   **Command Execution**: Handling the dispatch of commands and interacting with the underlying shell environment.
+-   **State Management**: Acting as a single source of truth for the terminal's state, including session details, command history, and the current working directory. This state is exposed via Kotlin Flows.
+-   **Event Notification**: Broadcasting events such as command output and directory changes through Kotlin Flows and an AIDL callback mechanism.
+
+## Key Components
+
+-   **`TerminalManager`**: A singleton class that serves as the main entry point for interacting with the module. It encapsulates all core logic and exposes reactive streams (Kotlin Flows) for observing the terminal's state.
+
+-   **`TerminalService`**: An Android `Service` that wraps the `TerminalManager`. It exposes the terminal's functionality via AIDL (`ITerminalService`), allowing it to be used as a background service and enabling communication from other processes.
+
+-   **AIDL Interface (`ITerminalService.aidl`, `ITerminalCallback.aidl`)**: Defines the contract for communication between the `TerminalService` and its clients. This allows the UI to run in a separate process from the terminal engine, preventing the terminal session from being terminated if the UI is closed.
+
+## Technical Implementation
+
+-   **Architecture**: The module utilizes a reactive architecture, with Kotlin Flows at its core for state management and event propagation.
+-   **Concurrency**: Asynchronous operations are managed using Kotlin Coroutines, ensuring that the main thread is not blocked.
+-   **Communication**: While designed for IPC with AIDL, the `TerminalManager` can also be used directly within the same process for a simpler setup.
+
+## Usage
+
+This module can be integrated as a Git Submodule. The client application can either bind to the `TerminalService` for background operation and IPC, or directly access the `TerminalManager` singleton if running in the same process. Refer to the main project's `README.md` for a detailed example of the AIDL interface.
+
+## 独立发行整合
+
+[终端核心来源与协同行为](docs/distribution_integration.md) 记录独立发行分支所包含的修复及验证范围。
+
+
+## 终端输入与显示
+
+[终端显示与键盘输入](docs/terminal_input.md) 说明零宽提示符、输入事件编码、会话顺序和光标配置。
+
+
+## 宿主本地会话初始化
+
+[本地会话初始化钩子](docs/local_session_initializer.md) 说明在登录就绪之前安装小型命令资源的接入方式。
+
+
+## Terminal protocol responses
+
+[Terminal protocol responses](docs/terminal_protocol_responses.md) documents status and cursor-position reports, session routing, and interactive prompt behavior.

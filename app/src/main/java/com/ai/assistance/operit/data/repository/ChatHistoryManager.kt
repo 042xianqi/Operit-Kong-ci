@@ -1,0 +1,3590 @@
+package com.ai.assistance.operit.data.repository
+
+import com.ai.assistance.operit.core.chat.context.TokenUsageBreakdown
+import com.ai.assistance.operit.data.chat.deletion.ChatDeletionPolicy
+import com.ai.assistance.operit.data.chat.deletion.ChatDeletionResult
+import androidx.room.withTransaction
+import com.ai.assistance.operit.data.chat.folders.ChatFolder
+import com.ai.assistance.operit.data.chat.folders.ChatFolderBinding
+import com.ai.assistance.operit.data.chat.folders.ChatFolderRepository
+import com.ai.assistance.operit.data.chat.folders.describe
+import com.ai.assistance.operit.data.chat.folders.folderAncestors
+import com.ai.assistance.operit.ui.common.a2ui.A2uiStateStore
+import android.content.Context
+import android.net.Uri
+import com.ai.assistance.operit.util.logging.AppLogger
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
+import com.ai.assistance.operit.R
+import com.ai.assistance.operit.data.backup.OperitBackupDirs
+import com.ai.assistance.operit.data.db.AppDatabase
+import com.ai.assistance.operit.data.dao.findPersistedAgentMessageMarkers
+import com.ai.assistance.operit.data.model.ChatEntity
+import com.ai.assistance.operit.data.model.ChatKind
+import com.ai.assistance.operit.core.agent.SubagentCoordinator
+import com.ai.assistance.operit.data.model.ChatHistory
+import com.ai.assistance.operit.data.model.ChatMessage
+import com.ai.assistance.operit.data.model.ChatMessageDisplayMode
+import com.ai.assistance.operit.data.model.ChatMessageLocatorPreview
+import com.ai.assistance.operit.data.model.ChatMessagePageMetadata
+import com.ai.assistance.operit.data.model.CharacterCardChatStats
+import com.ai.assistance.operit.data.model.CharacterGroupChatStats
+import com.ai.assistance.operit.data.model.MessageEntity
+import com.ai.assistance.operit.data.model.MessageVariantEntity
+import com.ai.assistance.operit.core.chat.protocol.MessageSectionCodec
+import com.ai.assistance.operit.data.chat.serialization.MessageSectionStorage
+import com.ai.assistance.operit.data.chat.archive.OperitArchivedChat
+import com.ai.assistance.operit.data.chat.archive.OperitArchivedMessage
+import com.ai.assistance.operit.data.chat.archive.OperitArchivedMessageVariant
+import com.ai.assistance.operit.data.chat.archive.OperitChatArchive
+import com.ai.assistance.operit.data.chat.archive.OperitChatArchiveReader
+import com.ai.assistance.operit.data.chat.archive.StagedChatArchive
+import com.ai.assistance.operit.data.chat.archive.ChatArchiveImportBatch
+import com.ai.assistance.operit.core.files.workspace.WorkspaceRenameResult
+import com.ai.assistance.operit.util.android.LocaleUtils
+import com.ai.assistance.operit.data.converter.*
+import com.ai.assistance.operit.data.exporter.*
+import com.google.gson.GsonBuilder
+import com.google.gson.stream.JsonWriter
+import com.google.gson.reflect.TypeToken
+import java.io.File
+import java.io.IOException
+import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Date
+import java.util.Locale
+import java.io.BufferedWriter
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.jsonObject
+import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
+import java.io.FileOutputStream
+import java.io.OutputStreamWriter
+import java.nio.charset.StandardCharsets
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.util.concurrent.ConcurrentHashMap
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
+
+// 仅保留这个DataStore用于存储当前聊天ID
+private val Context.currentChatIdDataStore by preferencesDataStore(name = "current_chat_id")
+
+data class ChatExportProgress(
+    val isLongText: Boolean,
+    val progress: Float,
+    val processedCharacters: Long,
+    val totalCharacters: Long,
+)
+
+data class ChatExportResult(
+    val filePath: String,
+    val chatCount: Int,
+)
+
+data class AddedMessageVariant(
+    val selectedVariantIndex: Int,
+    val message: ChatMessage,
+)
+
+private class ChatExportProgressReporter(
+    private val totalCharacters: Long,
+    private val onProgress: ((ChatExportProgress) -> Unit)?,
+) {
+    private var processedCharacters = 0L
+    private var lastReportedCharacters = 0L
+
+    fun add(characterCount: Long) {
+        processedCharacters += characterCount
+        report()
+    }
+
+    fun finish() {
+        processedCharacters = totalCharacters
+        report(force = true)
+    }
+
+    private fun report(force: Boolean = false) {
+        if (onProgress == null) {
+            return
+        }
+        val clampedProcessedCharacters = processedCharacters.coerceIn(0L, totalCharacters)
+        val shouldReport =
+            force ||
+                clampedProcessedCharacters - lastReportedCharacters >= 256 * 1024L
+        if (!shouldReport) {
+            return
+        }
+
+        lastReportedCharacters = clampedProcessedCharacters
+        val progress = if (totalCharacters == 0L) {
+            1f
+        } else {
+            clampedProcessedCharacters.toFloat() / totalCharacters.toFloat()
+        }
+        onProgress.invoke(
+            ChatExportProgress(
+                isLongText = true,
+                progress = progress.coerceIn(0f, 1f),
+                processedCharacters = clampedProcessedCharacters,
+                totalCharacters = totalCharacters,
+            )
+        )
+    }
+}
+
+private data class CsvMessageRecord(
+    val orderIndex: Int,
+    val message: ChatMessage,
+)
+
+private class CsvChatAccumulator(
+    val id: String,
+    val title: String,
+    val createdAt: LocalDateTime,
+    val updatedAt: LocalDateTime,
+    val inputTokens: Long,
+    val outputTokens: Long,
+    val currentWindowSize: Long,
+    val group: String?,
+    val displayOrder: Long,
+    val workspace: String?,
+    val workspaceEnv: String?,
+    val parentChatId: String?,
+    val characterCardName: String?,
+    val characterGroupId: String?,
+    val locked: Boolean,
+    val pinned: Boolean,
+    val archived: Boolean,
+    val folderId: String?,
+    val lastUsedAt: Long,
+    val folderPath: List<ChatFolder>,
+    val usageBreakdownJson: String?,
+) {
+    val messages = mutableListOf<CsvMessageRecord>()
+    val variantsByTimestamp = mutableMapOf<Long, MutableList<OperitArchivedMessageVariant>>()
+
+    fun toArchivedChat(): OperitArchivedChat {
+        val archivedMessages = messages
+            .sortedWith(compareBy<CsvMessageRecord> { it.orderIndex }.thenBy { it.message.timestamp })
+            .map { record ->
+                OperitArchivedMessage(
+                    baseMessage = record.message,
+                    variants = variantsByTimestamp[record.message.timestamp]
+                        .orEmpty()
+                        .sortedBy { it.variantIndex },
+                )
+            }
+        return OperitArchivedChat(
+            id = id,
+            title = title,
+            messages = archivedMessages,
+            createdAt = createdAt,
+            updatedAt = updatedAt,
+            inputTokens = inputTokens,
+            outputTokens = outputTokens,
+            currentWindowSize = currentWindowSize,
+            group = group,
+            displayOrder = displayOrder,
+            workspace = workspace,
+            workspaceEnv = workspaceEnv,
+            parentChatId = parentChatId,
+            characterCardName = characterCardName,
+            characterGroupId = characterGroupId,
+            locked = locked,
+            pinned = pinned,
+            archived = archived,
+            folderId = folderId,
+            lastUsedAt = lastUsedAt,
+            folderPath = folderPath,
+            usageBreakdownJson = usageBreakdownJson,
+        )
+    }
+}
+
+class ChatHistoryManager private constructor(private val context: Context) {
+    private val chatDraftRepository by lazy { ChatDraftRepository(context) }
+
+    private suspend fun clearDeletedChatDrafts() {
+        A2uiStateStore.deleteMissingChats(context, chatDao.getAllChatsDirectly().mapTo(mutableSetOf()) { it.id })
+        // 批量删除后只检查有草稿的聊天，避免额外扫描整段历史。
+        chatDraftRepository.chatIdsWithDrafts().forEach { chatId ->
+            if (chatDao.getChatById(chatId) == null) {
+                chatDraftRepository.removeDraft(chatId)
+            }
+        }
+    }
+
+    companion object {
+        private const val TAG = "ChatHistoryManager"
+        private const val LOCATOR_PREVIEW_CHAR_COUNT = 48
+        private const val TEXT_EXPORT_STREAMING_THRESHOLD_CHARACTER_COUNT = 4_000_000L
+        private const val TEXT_EXPORT_WRITER_BUFFER_SIZE = 64 * 1024
+        private const val MESSAGE_EXPORT_PAGE_SIZE = 32
+        private const val TEXT_EXPORT_PROGRESS_UPDATE_CHARACTER_COUNT = 256 * 1024L
+        private val JSON_DATE_FORMATTER = DateTimeFormatter.ISO_LOCAL_DATE_TIME
+
+        @Volatile
+        private var INSTANCE: ChatHistoryManager? = null
+
+        fun getInstance(context: Context): ChatHistoryManager {
+            return INSTANCE
+                ?: synchronized(this) {
+                    val instance = ChatHistoryManager(context.applicationContext)
+                    INSTANCE = instance
+                    instance
+                }
+        }
+    }
+
+    // 使用Room数据库
+    private val database = AppDatabase.getDatabase(context)
+    private val chatDao = database.chatDao()
+    val chatFolders = ChatFolderRepository(database)
+    private val messageDao = database.messageDao()
+    private val messageVariantDao = database.messageVariantDao()
+    private val chatContentDao = database.chatContentDao()
+    private val operitArchiveJson =
+        Json {
+            prettyPrint = true
+            encodeDefaults = true
+            ignoreUnknownKeys = true
+            isLenient = true
+        }
+
+    private data class ImportCounters(
+        var newCount: Int = 0,
+        var updatedCount: Int = 0,
+        var skippedCount: Int = 0,
+    )
+
+    private fun hydrateMessages(
+        messageEntities: List<MessageEntity>,
+        variants: List<MessageVariantEntity>,
+    ): List<ChatMessage> {
+        val variantsByTimestamp = variants.groupBy { it.messageTimestamp }
+        return messageEntities.map { messageEntity ->
+            val baseMessage = messageEntity.toChatMessage()
+            val messageVariants = variantsByTimestamp[messageEntity.timestamp].orEmpty()
+            val variantCount = messageVariants.size + 1
+            if (messageEntity.selectedVariantIndex == 0) {
+                baseMessage.copy(
+                    selectedVariantIndex = 0,
+                    variantCount = variantCount,
+                )
+            } else {
+                val selectedVariant =
+                    messageVariants.first { it.variantIndex == messageEntity.selectedVariantIndex }
+                selectedVariant.applyTo(baseMessage, variantCount)
+            }
+        }
+    }
+
+    private suspend fun hydrateMessages(
+        chatId: String,
+        messageEntities: List<MessageEntity>,
+    ): List<ChatMessage> {
+        if (messageEntities.isEmpty()) {
+            return emptyList()
+        }
+        val visibleTimestamps = messageEntities.map { it.timestamp }
+        val variants = chatContentDao.getVariantsForMessages(chatId, visibleTimestamps)
+        return hydrateMessages(messageEntities, variants)
+    }
+
+    private suspend fun loadDisplayHistory(chatHistory: ChatHistory): ChatHistory {
+        val messages = loadChatMessages(chatHistory.id)
+        return chatHistory.copy(messages = messages)
+    }
+
+    private suspend fun loadDisplayHistories(chatHistories: List<ChatHistory>): List<ChatHistory> {
+        val completeHistories = mutableListOf<ChatHistory>()
+        for (chatHistory in chatHistories) {
+            completeHistories.add(loadDisplayHistory(chatHistory))
+        }
+        return completeHistories
+    }
+
+    /** 分条输出图内消息，避免把整棵树再编码成一个巨大的临时字符串。 */
+    private fun writeGraphArchiveChat(writer: JsonWriter, chat: OperitArchivedChat, progress: ChatExportProgressReporter) {
+        writer.beginObject()
+        val metadata = operitArchiveJson.encodeToJsonElement(chat.copy(messages = emptyList(), subagentGraph = null))
+        for ((name, value) in metadata.jsonObject) {
+            if (name != "messages" && name != "subagentGraph") writer.name(name).jsonValue(value.toString())
+        }
+        writer.name("messages").beginArray()
+        for (row in chat.messages) {
+            writer.beginObject()
+            writer.name("baseMessage")
+            writeJsonMessage(writer, row.baseMessage)
+            writer.name("variants").beginArray()
+            for (variant in row.variants) {
+                writer.jsonValue(operitArchiveJson.encodeToString(variant))
+                progress.add(MessageSectionCodec.render(variant.sections).length.toLong())
+            }
+            writer.endArray()
+            writer.endObject()
+            progress.add(row.baseMessage.content.length.toLong())
+        }
+        writer.endArray()
+        chat.subagentGraph?.let { graph ->
+            writer.name("subagentGraph").beginObject()
+            writer.name("version").value(graph.version)
+            writer.name("tasks").beginArray()
+            graph.tasks.forEach { writer.jsonValue(operitArchiveJson.encodeToString(it)) }
+            writer.endArray()
+            writer.name("chats").beginArray()
+            graph.chats.forEach { writeGraphArchiveChat(writer, it, progress) }
+            writer.endArray()
+            writer.endObject()
+        }
+        writer.endObject()
+    }
+
+    private suspend fun exportOperitArchiveJsonStream(
+        file: File,
+        chatHistories: List<ChatHistory>,
+        totalTextCharacters: Long,
+        onProgress: ((ChatExportProgress) -> Unit)?,
+    ) {
+        val exportedFolders = chatFolders.exportFolders(chatHistories.map { it.id }.toSet())
+        val foldersById = exportedFolders.associateBy { it.id }
+        AppLogger.d(TAG, "开始流式导出 Operit 聊天记录，共 ${chatHistories.size} 个会话，目标=${file.absolutePath}")
+        val progressReporter = ChatExportProgressReporter(totalTextCharacters, onProgress)
+        JsonWriter(
+            BufferedWriter(
+                OutputStreamWriter(FileOutputStream(file), StandardCharsets.UTF_8),
+                TEXT_EXPORT_WRITER_BUFFER_SIZE,
+            )
+        ).use { writer ->
+            writer.setIndent("  ")
+            writer.beginObject()
+            writer.name("archiveType").value(OperitChatArchive.ARCHIVE_TYPE)
+            writer.name("formatVersion").value(OperitChatArchive.CURRENT_FORMAT_VERSION)
+            writer.name("exportedAt").value(System.currentTimeMillis())
+            writer.name("folders").jsonValue(operitArchiveJson.encodeToString(exportedFolders))
+            writer.name("chats").beginArray()
+
+            for ((index, chatHistory) in chatHistories.withIndex()) {
+                val snapshot = com.ai.assistance.operit.core.agent.SubagentCoordinator.getInstance(context).exportArchive(chatHistory.id)
+                if (snapshot != null) {
+                    writeGraphArchiveChat(writer, snapshot.copy(folderPath = folderAncestors(snapshot.folderId, foldersById)), progressReporter)
+                    writer.flush()
+                    yield()
+                    continue
+                }
+                writer.beginObject()
+                writer.name("id").value(chatHistory.id)
+                writer.name("title").value(chatHistory.title)
+                writer.name("messages").beginArray()
+
+                var offset = 0
+                while (true) {
+                    val messagePage = chatContentDao.getMessagesForChatAscRange(
+                        chatId = chatHistory.id,
+                        offset = offset,
+                        limit = MESSAGE_EXPORT_PAGE_SIZE,
+                    )
+                    if (messagePage.isEmpty()) {
+                        break
+                    }
+
+                    val variantsByTimestamp =
+                        chatContentDao
+                            .getVariantsForMessages(
+                                chatHistory.id,
+                                messagePage.map { it.timestamp },
+                            )
+                            .groupBy { it.messageTimestamp }
+                    for (messageEntity in messagePage) {
+                        val variants = variantsByTimestamp[messageEntity.timestamp].orEmpty()
+                        val message = messageEntity.toChatMessage().copy(
+                            variantCount = variants.size + 1,
+                        )
+                        writer.beginObject()
+                        writer.name("baseMessage")
+                        writeJsonMessage(writer, message)
+                        writer.name("variants").beginArray()
+                        for (variant in variants) {
+                            writeJsonVariant(writer, variant)
+                            progressReporter.add(MessageSectionCodec.render(MessageSectionStorage.decode(variant.sections, variant.searchText)).length.toLong())
+                        }
+                        writer.endArray()
+                        writer.endObject()
+                        progressReporter.add(message.content.length.toLong())
+                    }
+
+                    offset += messagePage.size
+                    writer.flush()
+                    yield()
+                }
+
+                writer.endArray()
+                writer.name("createdAt").value(chatHistory.createdAt.format(JSON_DATE_FORMATTER))
+                writer.name("updatedAt").value(chatHistory.updatedAt.format(JSON_DATE_FORMATTER))
+                writer.name("inputTokens").value(chatHistory.inputTokens)
+                writer.name("outputTokens").value(chatHistory.outputTokens)
+                writer.name("currentWindowSize").value(chatHistory.currentWindowSize)
+                writer.writeNullableString("group", chatHistory.group)
+                writer.writeNullableString("folderId", chatHistory.folderId)
+                writer.name("lastUsedAt").value(chatHistory.lastUsedAt)
+                writer.name("folderPath").jsonValue(
+                    operitArchiveJson.encodeToString(folderAncestors(chatHistory.folderId, foldersById)),
+                )
+                writer.name("displayOrder").value(chatHistory.displayOrder)
+                writer.writeNullableString("workspace", chatHistory.workspace)
+                writer.writeNullableString("workspaceEnv", chatHistory.workspaceEnv)
+                writer.writeNullableString("parentChatId", chatHistory.parentChatId)
+                writer.writeNullableString("characterCardName", chatHistory.characterCardName)
+                writer.writeNullableString("characterGroupId", chatHistory.characterGroupId)
+                writer.name("locked").value(chatHistory.locked)
+                writer.name("pinned").value(chatHistory.pinned)
+                writer.name("archived").value(chatHistory.archived)
+                writer.name("chatKind").value(chatHistory.chatKind)
+                writer.writeNullableString("usageBreakdownJson", chatHistory.usageBreakdownJson)
+                writer.endObject()
+
+                if ((index + 1) % 20 == 0 || index == chatHistories.lastIndex) {
+                    AppLogger.d(TAG, "流式导出进度: ${index + 1}/${chatHistories.size}，chatId=${chatHistory.id}")
+                }
+            }
+
+            writer.endArray()
+            writer.endObject()
+            writer.flush()
+        }
+        progressReporter.finish()
+        AppLogger.d(TAG, "流式导出 Operit 聊天记录完成，共 ${chatHistories.size} 个会话，目标=${file.absolutePath}")
+    }
+
+    private fun writeJsonMessage(writer: JsonWriter, message: ChatMessage) {
+        // 每次只序列化一条消息，使用统一序列化器保留结构化片段与旧备份兼容语义。
+        writer.jsonValue(operitArchiveJson.encodeToString(message))
+    }
+
+    private fun writeJsonVariant(writer: JsonWriter, variant: MessageVariantEntity) {
+        writer.jsonValue(operitArchiveJson.encodeToString(OperitArchivedMessageVariant.fromEntity(variant)))
+    }
+
+    private fun JsonWriter.writeNullableString(name: String, value: String?) {
+        name(name)
+        if (value == null) {
+            nullValue()
+        } else {
+            value(value)
+        }
+    }
+
+    private suspend fun consumeImportedChat(
+        archivedChat: OperitArchivedChat,
+        existingIds: MutableSet<String>,
+        counters: ImportCounters,
+        importedIndex: Int,
+    ) {
+        chatFolders.importFolders(archivedChat.folderPath) { it.describe(context) }
+        if (archivedChat.folderId == null && archivedChat.group != null) {
+            chatFolders.ensureLegacyRoot(archivedChat.group, ChatFolderBinding(archivedChat.characterCardName, archivedChat.characterGroupId))
+        }
+        if (archivedChat.messages.isEmpty()) {
+            counters.skippedCount++
+            AppLogger.w(TAG, "流式导入跳过空归档会话: index=$importedIndex, chatId=${archivedChat.id}")
+            return
+        }
+
+        val existed = existingIds.contains(archivedChat.id)
+        if (existed) {
+            counters.updatedCount++
+        } else {
+            counters.newCount++
+            existingIds.add(archivedChat.id)
+        }
+
+        saveArchivedChat(archivedChat)
+
+        if (importedIndex % 20 == 0) {
+            AppLogger.d(
+                TAG,
+                "流式导入进度: index=$importedIndex, archive chatId=${archivedChat.id}, messages=${archivedChat.messages.size}, new=${counters.newCount}, updated=${counters.updatedCount}, skipped=${counters.skippedCount}",
+            )
+        }
+    }
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    private suspend fun importOperitChatHistoriesStream(
+        inputStream: InputStream,
+        existingIds: MutableSet<String>,
+    ): ChatImportResult {
+        val counters = ImportCounters()
+        var importedIndex = 0
+        OperitChatArchiveReader(operitArchiveJson, context.cacheDir).read(
+            InputStreamReader(inputStream, StandardCharsets.UTF_8),
+            onFolders = { chatFolders.importFolders(it) { error -> error.describe(context) } },
+            onChat = { staged ->
+                importedIndex++
+                if (staged.metadata.subagentGraph != null) {
+                    val archive = staged.readGraph()
+                    chatFolders.importFolders(archive.folderPath) { it.describe(context) }
+                    val newId = com.ai.assistance.operit.core.agent.SubagentCoordinator.getInstance(context).importGraph(archive)
+                    existingIds.add(newId)
+                    counters.newCount++
+                } else if (staged.messageCount == 0) {
+                    require(staged.metadata.chatKind == ChatKind.NORMAL) { "A child conversation must be imported with its complete graph" }
+                    chatFolders.importFolders(staged.metadata.folderPath) { it.describe(context) }
+                    if (staged.metadata.folderId == null && staged.metadata.group != null) {
+                        chatFolders.ensureLegacyRoot(staged.metadata.group, ChatFolderBinding(staged.metadata.characterCardName, staged.metadata.characterGroupId))
+                    }
+                    counters.skippedCount++
+                } else {
+                    saveStagedChat(staged)
+                    if (existingIds.add(staged.metadata.id)) counters.newCount++ else counters.updatedCount++
+                }
+            },
+        )
+        AppLogger.d(TAG, "消息级导入完成: total=$importedIndex, new=${counters.newCount}, updated=${counters.updatedCount}, skipped=${counters.skippedCount}")
+        return ChatImportResult(counters.newCount, counters.updatedCount, counters.skippedCount)
+    }
+
+    /** 每个会话独立事务；后半段消息损坏或取消时，不提交已经写入的前半段。 */
+    private suspend fun saveStagedChat(staged: StagedChatArchive) {
+        val history = staged.metadata.toChatHistory()
+        require(history.chatKind == ChatKind.NORMAL) { "A child conversation must be imported with its complete graph" }
+        chatMutex(history.id).withLock {
+            database.withTransaction {
+                requireNormalConversation(history.id)
+                chatFolders.importFolders(staged.metadata.folderPath) { it.describe(context) }
+                val folder = when {
+                    history.folderId != null -> chatFolders.getFolder(history.folderId)
+                    history.group != null -> chatFolders.ensureLegacyRoot(
+                        history.group, ChatFolderBinding(history.characterCardName, history.characterGroupId),
+                    )
+                    else -> null
+                }
+                val original = chatDao.getChatById(history.id)
+                var lastUsed = if (history.lastUsedAt == 0L)
+                    history.createdAt.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                    else history.lastUsedAt
+                val entity = ChatEntity.fromChatHistory(history).copy(
+                    folderId = folder?.id, group = folder?.name,
+                    lastUsedAt = maxOf(lastUsed, original?.lastUsedAt ?: 0L),
+                )
+                chatDao.insertChat(entity)
+                messageDao.deleteAllMessagesForChat(history.id)
+                messageVariantDao.deleteAllVariantsForChat(history.id)
+                val batch = ChatArchiveImportBatch { messages, variants ->
+                    messageDao.insertMessages(messages)
+                    if (variants.isNotEmpty()) messageVariantDao.insertVariants(variants)
+                }
+                staged.forEachMessage { index, archived ->
+                    val message = archived.baseMessage
+                    val variants = archived.variants.sortedBy { it.variantIndex }
+                    validateArchivedMessageVariants(message, variants)
+                    if (history.lastUsedAt == 0L && message.sender == "user") lastUsed = maxOf(lastUsed, message.timestamp)
+                    val saved = message.copy(
+                        selectedVariantIndex = if (archived.variants.isEmpty()) 0 else message.selectedVariantIndex,
+                        variantCount = archived.variants.size + 1,
+                    )
+                    batch.add(MessageEntity.fromChatMessage(history.id, saved, index), variants.map {
+                        it.toEntity(history.id, message.timestamp)
+                    })
+                }
+                batch.flush()
+                chatDao.markChatUsed(history.id, lastUsed)
+            }
+            // 文件系统副作用在数据库提交之后执行，失败导入不会清空旧会话的卡片状态。
+            withContext(kotlinx.coroutines.NonCancellable) { A2uiStateStore.clearChat(context, history.id) }
+        }
+    }
+
+    init {
+        // 确保数据库被初始化
+        AppLogger.d(TAG, "ChatHistoryManager初始化，预加载数据库")
+        // 使用独立的协程作用域触发数据库初始化
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // 预先尝试执行一个简单查询
+                val chats = chatDao.getAllChats().first()
+                AppLogger.d(TAG, "数据库预加载完成，现有聊天数：${chats.size}")
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "数据库预加载失败", e)
+            }
+        }
+    }
+
+    // 互斥锁用于同步操作
+    private val globalMutex = Mutex()
+    private val chatMutexes = ConcurrentHashMap<String, Mutex>()
+
+    private fun chatMutex(chatId: String): Mutex {
+        return chatMutexes.getOrPut(chatId) { Mutex() }
+    }
+
+    // DataStore键
+    private object PreferencesKeys {
+        val CURRENT_CHAT_ID = stringPreferencesKey("current_chat_id")
+    }
+
+    // 辅助函数：将ChatEntity转换为ChatHistory
+    private fun ChatEntity.toChatHistory(): ChatHistory {
+        val createdAt = Instant.ofEpochMilli(this.createdAt)
+            .atZone(ZoneId.systemDefault())
+            .toLocalDateTime()
+
+        val updatedAt = Instant.ofEpochMilli(this.updatedAt)
+            .atZone(ZoneId.systemDefault())
+            .toLocalDateTime()
+
+        return ChatHistory(
+            id = this.id,
+            title = this.title,
+            messages = emptyList(), // 关键改动：不加载完整消息，以提高侧边栏性能
+            createdAt = createdAt,
+            updatedAt = updatedAt,
+            inputTokens = this.inputTokens,
+            outputTokens = this.outputTokens,
+            currentWindowSize = this.currentWindowSize,
+            usageBreakdownJson = this.usageBreakdownJson,
+            group = this.group, // 映射group字段
+            displayOrder = this.displayOrder,
+            workspace = this.workspace, // 映射workspace字段
+            workspaceEnv = this.workspaceEnv, // 映射workspaceEnv字段
+            parentChatId = this.parentChatId, // 映射parentChatId字段
+            chatKind = this.chatKind,
+            characterCardName = this.characterCardName, // 映射characterCardName字段
+            characterGroupId = this.characterGroupId, // 映射characterGroupId字段
+            locked = this.locked,
+            folderId = this.folderId,
+            lastUsedAt = this.lastUsedAt,
+            pinned = this.pinned,
+            archived = this.archived
+        )
+    }
+
+    // 获取所有聊天历史（转换为UI层需要的ChatHistory对象）
+    private val _chatHistoriesFlow: Flow<List<ChatHistory>> =
+        // 使用原始的Flow方式，这样可以确保数据库变化时会自动刷新
+        chatDao.getAllChats().map { chatEntities ->
+            // AppLogger.d(TAG, "加载聊天列表，共 ${chatEntities.size} 个聊天")
+
+            // 使用withContext将处理移至IO线程
+            kotlinx.coroutines.withContext(Dispatchers.IO) {
+                chatEntities.map { it.toChatHistory() }
+            }
+        }
+
+    // 转换为StateFlow以便共享
+    val chatHistoriesFlow =
+        _chatHistoriesFlow.stateIn(
+            CoroutineScope(Dispatchers.IO + SupervisorJob()),
+            SharingStarted.Lazily,
+            emptyList()
+        )
+
+    suspend fun getTotalChatCount(): Int {
+        return withContext(Dispatchers.IO) { chatDao.getTotalChatCount() }
+    }
+
+    suspend fun getTotalMessageCount(): Int {
+        return withContext(Dispatchers.IO) { messageDao.getTotalMessageCount() }
+    }
+
+    suspend fun getMessageCountsByChatId(): Map<String, Int> {
+        return withContext(Dispatchers.IO) {
+            try {
+                messageDao.getMessageCountsByChatId().associate { it.chatId to it.count }
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to get message counts by chatId", e)
+                emptyMap()
+            }
+        }
+    }
+
+    // 角色卡聊天统计
+    val characterCardStatsFlow: Flow<List<CharacterCardChatStats>> =
+        chatDao.getCharacterCardChatStats()
+    val characterGroupStatsFlow: Flow<List<CharacterGroupChatStats>> =
+        chatDao.getCharacterGroupChatStats()
+
+    /**
+     * 根据角色卡过滤聊天历史
+     * @param characterCardName 角色卡名称
+     * @param isDefault 是否为默认角色卡
+     * @return 过滤后的聊天历史Flow
+     */
+    fun getChatHistoriesByCharacterCard(
+        characterCardName: String,
+        isDefault: Boolean
+    ): Flow<List<ChatHistory>> {
+        val sourceFlow = if (isDefault) {
+            // 默认角色卡：显示该角色卡名称的对话 + 所有characterCardName为null的对话
+            chatDao.getChatsByCharacterCardOrNull(characterCardName)
+        } else {
+            // 非默认角色卡：只显示该角色卡名称的对话
+            chatDao.getChatsByCharacterCard(characterCardName)
+        }
+
+        return sourceFlow.map { chatEntities ->
+            kotlinx.coroutines.withContext(Dispatchers.IO) {
+                chatEntities.map { it.toChatHistory() }
+            }
+        }
+    }
+
+    // 获取当前聊天ID
+    private val _currentChatIdFlow: Flow<String?> =
+        context.currentChatIdDataStore.data
+            .catch { exception ->
+                if (exception is IOException) {
+                    emit(emptyPreferences())
+                } else {
+                    throw exception
+                }
+            }
+            .map { preferences -> preferences[PreferencesKeys.CURRENT_CHAT_ID] }
+
+    // 转换为StateFlow以便共享
+    val currentChatIdFlow =
+        _currentChatIdFlow.stateIn(
+            CoroutineScope(Dispatchers.IO + SupervisorJob()),
+            SharingStarted.Lazily,
+            null
+        )
+
+    private fun validateArchivedMessageVariants(
+        message: ChatMessage,
+        variants: List<OperitArchivedMessageVariant>,
+    ) {
+        if (variants.isEmpty()) {
+            return
+        }
+
+        require(message.sender == "ai") {
+            "Only AI messages can contain archived variants"
+        }
+        require(message.selectedVariantIndex >= 0) {
+            "Selected variant index must not be negative for message ${message.timestamp}"
+        }
+
+        val variantIndices = variants.map { it.variantIndex }
+        require(variantIndices.all { it > 0 }) {
+            "Variant indices must be positive for message ${message.timestamp}"
+        }
+        require(variantIndices.distinct().size == variantIndices.size) {
+            "Duplicate variant indices found for message ${message.timestamp}"
+        }
+        require(
+            message.selectedVariantIndex == 0 ||
+                variantIndices.contains(message.selectedVariantIndex),
+        ) {
+            "Selected variant ${message.selectedVariantIndex} is missing for message ${message.timestamp}"
+        }
+    }
+
+    private suspend fun saveChatHistoryInternal(
+        history: ChatHistory,
+        variantsByTimestamp: Map<Long, List<OperitArchivedMessageVariant>> = emptyMap(),
+    ) {
+        require(history.chatKind == ChatKind.NORMAL) { "Subagent conversations are owned by their task" }
+        chatMutex(history.id).withLock {
+            database.withTransaction {
+                requireNormalConversation(history.id)
+                // 创建聊天实体
+                val folder = when {
+                    history.folderId != null -> chatFolders.getFolder(history.folderId)
+                    history.group != null -> chatFolders.ensureLegacyRoot(
+                        history.group, ChatFolderBinding(history.characterCardName, history.characterGroupId),
+                    )
+                    else -> null
+                }
+                val original = chatDao.getChatById(history.id)
+                val importedUseTime = if (history.lastUsedAt == 0L) {
+                    maxOf(
+                        history.createdAt.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli(),
+                        history.messages.filter { it.sender == "user" }.maxOfOrNull { it.timestamp } ?: 0L,
+                    )
+                } else history.lastUsedAt
+                val chatEntity = ChatEntity.fromChatHistory(history).copy(
+                    folderId = folder?.id, group = folder?.name,
+                    displayOrder = history.displayOrder,
+                    lastUsedAt = maxOf(importedUseTime, original?.lastUsedAt ?: 0L),
+                )
+
+                // 保存聊天实体
+                chatDao.insertChat(chatEntity)
+
+                // 先删除该聊天的所有现有消息
+                messageDao.deleteAllMessagesForChat(chatEntity.id)
+                A2uiStateStore.clearChat(context, chatEntity.id)
+                messageVariantDao.deleteAllVariantsForChat(chatEntity.id)
+
+                // 批量插入所有消息
+                val messageEntities =
+                    history.messages.mapIndexed { index, message ->
+                        val archivedVariants =
+                            variantsByTimestamp[message.timestamp]
+                                .orEmpty()
+                                .sortedBy { it.variantIndex }
+                        if (archivedVariants.isNotEmpty()) {
+                            validateArchivedMessageVariants(message, archivedVariants)
+                        }
+                        MessageEntity.fromChatMessage(
+                            chatEntity.id,
+                            if (archivedVariants.isEmpty()) {
+                                message.copy(selectedVariantIndex = 0, variantCount = 1)
+                            } else {
+                                message.copy(variantCount = archivedVariants.size + 1)
+                            },
+                            index,
+                        )
+                    }
+                messageDao.insertMessages(messageEntities)
+
+                val variantEntities =
+                    history.messages.flatMap { message ->
+                        variantsByTimestamp[message.timestamp]
+                            .orEmpty()
+                            .sortedBy { it.variantIndex }
+                            .map { variant ->
+                                variant.toEntity(
+                                    chatId = chatEntity.id,
+                                    messageTimestamp = message.timestamp,
+                                )
+                            }
+                    }
+                if (variantEntities.isNotEmpty()) {
+                    messageVariantDao.insertVariants(variantEntities)
+                }
+            }
+        }
+    }
+
+    // 保存聊天历史
+    suspend fun saveChatHistory(history: ChatHistory) {
+        saveChatHistoryInternal(history)
+    }
+
+    private suspend fun saveArchivedChat(history: OperitArchivedChat) {
+        val variantsByTimestamp =
+            history.messages.associate { archivedMessage ->
+                archivedMessage.baseMessage.timestamp to archivedMessage.variants
+            }
+        saveChatHistoryInternal(history.toChatHistory(), variantsByTimestamp)
+    }
+
+    /** 保留消息和绑定关系，仅切换会话在归档列表中的归属。 */
+    suspend fun updateChatArchived(chatId: String, archived: Boolean) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock { chatDao.updateChatArchived(chatId, archived) }
+    }
+
+    /** 更新聊天锁定状态 */
+    suspend fun updateChatLocked(chatId: String, locked: Boolean) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                chatDao.updateChatLocked(chatId, locked)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to update chat locked state for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    /** 更新聊天置顶状态 */
+    suspend fun updateChatPinned(chatId: String, pinned: Boolean) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                chatDao.updateChatPinned(chatId, pinned)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to update chat pinned state for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    private suspend fun persistMessageLocked(chatId: String, messageToPersist: ChatMessage): ChatMessage {
+        val nextOrderIndex = (messageDao.getMaxOrderIndex(chatId) ?: -1) + 1
+        val messageEntity =
+            MessageEntity.fromChatMessage(
+                chatId = chatId,
+                message = messageToPersist,
+                orderIndex = nextOrderIndex,
+            )
+        messageDao.insertMessage(messageEntity)
+
+        chatDao.getChatById(chatId)?.let { chat ->
+            chatDao.updateChatMetadata(
+                chatId = chatId,
+                title = chat.title,
+                timestamp = System.currentTimeMillis(),
+                inputTokens = chat.inputTokens,
+                outputTokens = chat.outputTokens,
+                currentWindowSize = chat.currentWindowSize
+            )
+        }
+
+        return messageToPersist
+    }
+
+    private suspend fun resolveAnchoredMessageLocked(
+        chatId: String,
+        message: ChatMessage,
+        beforeTimestamp: Long?,
+        afterTimestamp: Long?,
+    ): ChatMessage? {
+        if (beforeTimestamp == null && afterTimestamp == null) {
+            val hasAnyMessages = messageDao.existsAnyMessage(chatId)
+            return if (hasAnyMessages) {
+                AppLogger.w(TAG, "缺少插入锚点，拒绝在非空聊天中插入消息: chatId=$chatId")
+                null
+            } else {
+                message
+            }
+        }
+
+        val beforeMessage =
+            when {
+                beforeTimestamp != null -> chatContentDao.getMessageByTimestamp(chatId, beforeTimestamp)
+                afterTimestamp != null ->
+                    chatContentDao
+                        .getMessagesForChatBeforeTimestampExclusiveDesc(
+                            chatId,
+                            afterTimestamp,
+                            1,
+                        ).firstOrNull()
+
+                else -> null
+            }
+        val afterMessage =
+            when {
+                beforeTimestamp != null && afterTimestamp == null ->
+                    chatContentDao
+                        .getMessagesForChatAfterTimestampExclusiveAsc(
+                            chatId,
+                            beforeTimestamp,
+                            1,
+                        ).firstOrNull()
+                afterTimestamp != null -> chatContentDao.getMessageByTimestamp(chatId, afterTimestamp)
+                else -> null
+            }
+
+        if (beforeTimestamp != null && beforeMessage == null) {
+            AppLogger.w(
+                TAG,
+                "插入消息失败，未找到前置锚点: chatId=$chatId, beforeTimestamp=$beforeTimestamp",
+            )
+            return null
+        }
+        if (afterTimestamp != null && afterMessage == null) {
+            AppLogger.w(
+                TAG,
+                "插入消息失败，未找到后置锚点: chatId=$chatId, afterTimestamp=$afterTimestamp",
+            )
+            return null
+        }
+
+        val actualBeforeTimestamp = beforeMessage?.timestamp
+        val actualAfterTimestamp = afterMessage?.timestamp
+
+        if (
+            actualBeforeTimestamp != null &&
+            actualAfterTimestamp != null &&
+            actualBeforeTimestamp >= actualAfterTimestamp
+        ) {
+            AppLogger.w(
+                TAG,
+                "插入消息失败，前后锚点顺序非法: chatId=$chatId, before=$actualBeforeTimestamp, after=$actualAfterTimestamp",
+            )
+            return null
+        }
+
+        return when {
+            actualBeforeTimestamp != null && actualAfterTimestamp != null -> {
+                if (actualAfterTimestamp - actualBeforeTimestamp <= 1L) {
+                    AppLogger.w(
+                        TAG,
+                        "插入消息失败，前后锚点时间戳间隔不足: chatId=$chatId, before=$actualBeforeTimestamp, after=$actualAfterTimestamp",
+                    )
+                    null
+                } else {
+                    message.copy(
+                        timestamp =
+                            actualBeforeTimestamp +
+                                (actualAfterTimestamp - actualBeforeTimestamp) / 2L,
+                    )
+                }
+            }
+
+            actualBeforeTimestamp != null -> {
+                message.copy(timestamp = actualBeforeTimestamp + 1L)
+            }
+
+            actualAfterTimestamp != null -> {
+                message.copy(timestamp = actualAfterTimestamp - 1L)
+            }
+
+            else -> message
+        }
+    }
+
+    suspend fun addSummaryMessageBetweenSliceNeighbors(
+        chatId: String,
+        message: ChatMessage,
+        beforeTimestamp: Long?,
+        afterTimestamp: Long?,
+    ): ChatMessage? {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                val beforeMessage =
+                    when {
+                        beforeTimestamp != null -> chatContentDao.getMessageByTimestamp(chatId, beforeTimestamp)
+                        afterTimestamp != null ->
+                            chatContentDao
+                                .getMessagesForChatBeforeTimestampExclusiveDesc(
+                                    chatId,
+                                    afterTimestamp,
+                                    1,
+                                ).firstOrNull()
+                        else -> null
+                    }
+                val afterMessage =
+                    when {
+                        beforeTimestamp != null && afterTimestamp == null ->
+                            chatContentDao
+                                .getMessagesForChatAfterTimestampExclusiveAsc(
+                                    chatId,
+                                    beforeTimestamp,
+                                    1,
+                                ).firstOrNull()
+                        afterTimestamp != null -> chatContentDao.getMessageByTimestamp(chatId, afterTimestamp)
+                        else -> null
+                    }
+
+                if (beforeMessage?.sender == "summary" || afterMessage?.sender == "summary") {
+                    AppLogger.w(
+                        TAG,
+                        "相邻消息已是 summary，取消插入: chatId=$chatId, before=${beforeMessage?.timestamp}, after=${afterMessage?.timestamp}",
+                    )
+                    return null
+                }
+
+                val messageToPersist =
+                    resolveAnchoredMessageLocked(
+                        chatId = chatId,
+                        message = message,
+                        beforeTimestamp = beforeTimestamp,
+                        afterTimestamp = afterTimestamp,
+                    ) ?: return null
+                return persistMessageLocked(chatId, messageToPersist)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to add summary message between slice neighbors for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    // 添加单条消息，并返回最终持久化的消息
+    suspend fun addMessage(chatId: String, message: ChatMessage): ChatMessage {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                val persisted = persistMessageLocked(chatId, message)
+                if (message.sender == "user") markChatUsed(chatId)
+                return persisted
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to add message for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 批量更新聊天记录的顺序和分组
+     * @param updatedHistories 包含更新信息的ChatHistory列表
+     */
+    suspend fun updateChatOrderAndGroup(updatedHistories: List<ChatHistory>) {
+        globalMutex.withLock {
+            database.withTransaction {
+                updatedHistories.forEach { history ->
+                    val original = requireNotNull(chatDao.getChatById(history.id))
+                    require(original.chatKind == ChatKind.NORMAL) { "Subagent conversations cannot be reordered" }
+                    val folder = if (history.group == original.group) {
+                        original.folderId?.let { chatFolders.getFolder(it) }
+                    } else {
+                        history.group?.let { chatFolders.ensureLegacyRoot(it, ChatFolderBinding(null, null)) }
+                    }
+                    chatDao.moveChatFolder(history.id, folder?.id, folder?.name, history.displayOrder)
+                }
+            }
+        }
+    }
+    /**
+     * 重命名分组
+     * @param oldName 旧的分组名称
+     * @param newName 新的分组名称
+     * @param characterCardName 角色卡名称，如果为null则更新所有同名分组
+     */
+    suspend fun updateGroupName(oldName: String, newName: String, characterCardName: String?) {
+        database.withTransaction {
+            if (characterCardName == null) {
+                chatFolders.getFolders().filter { it.parentId == null && it.name == oldName }.forEach {
+                    chatFolders.rename(it.id, newName)
+                }
+            } else {
+                val ids = chatDao.getAllChatsDirectly()
+                    .filter { it.chatKind == ChatKind.NORMAL && it.group == oldName && it.characterCardName == characterCardName }.map { it.id }
+                val folder = chatFolders.ensureLegacyRoot(newName, ChatFolderBinding(characterCardName, null))
+                chatFolders.assignChats(ids, folder.id)
+            }
+        }
+    }
+    /**
+     * 删除分组
+     * @param groupName 要删除的分组名称
+     * @param deleteChats 是否同时删除分组下的聊天记录
+     * @param characterCardName 角色卡名称，如果为null则删除所有同名分组
+     */
+    suspend fun deleteGroup(groupName: String, deleteChats: Boolean, characterCardName: String?) {
+        val targets = chatDao.getAllChatsDirectly().filter {
+            it.chatKind == ChatKind.NORMAL && it.group == groupName &&
+                (characterCardName == null || it.characterCardName == characterCardName)
+        }
+        for (target in targets) {
+            if (deleteChats && !target.locked) {
+                val deleted = deleteOrdinaryChat(target.id, allowCurrentChat = true)
+                if (deleted && currentChatIdFlow.first() == target.id) clearCurrentChatId()
+            } else chatFolders.assignChats(listOf(target.id), null)
+        }
+        if (characterCardName == null) {
+            database.withTransaction {
+                chatFolders.getFolders().filter { it.parentId == null && it.name == groupName }.forEach {
+                    chatFolders.deleteKeepingContents(it.id)
+                }
+            }
+        }
+        clearDeletedChatDrafts()
+    }
+    /**
+     * 删除单条消息.
+     * @param chatId 聊天ID
+     * @param timestamp 消息时间戳
+     */
+    suspend fun deleteMessage(chatId: String, timestamp: Long) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                AppLogger.d(TAG, "正在从数据库删除消息. ChatId: $chatId, Timestamp: $timestamp")
+                messageVariantDao.deleteVariantsForMessage(chatId, timestamp)
+                messageDao.deleteMessageByTimestamp(chatId, timestamp)
+                A2uiStateStore.deleteMessages(context, chatId, timestamp)
+                AppLogger.d(TAG, "消息从数据库删除成功.")
+
+                // Update chat metadata
+                chatDao.getChatById(chatId)?.let { chat ->
+                    chatDao.updateChatMetadata(
+                        chatId = chatId,
+                        title = chat.title,
+                        timestamp = System.currentTimeMillis(),
+                        inputTokens = chat.inputTokens,
+                        outputTokens = chat.outputTokens,
+                        currentWindowSize = chat.currentWindowSize
+                    )
+                }
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to delete message with timestamp $timestamp for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    suspend fun deleteMessageVariant(
+        chatId: String,
+        messageTimestamp: Long,
+        variantIndex: Int,
+    ) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                val baseMessage =
+                    chatContentDao.getMessageByTimestamp(chatId, messageTimestamp)
+                        ?: throw IllegalArgumentException(
+                            "Message $messageTimestamp does not exist in chat $chatId",
+                        )
+                if (baseMessage.sender != "ai") {
+                    throw IllegalArgumentException("Only AI messages can delete variants")
+                }
+
+                val variants =
+                    chatContentDao.getVariantsForMessage(chatId, messageTimestamp)
+                        .sortedBy { it.variantIndex }
+                if (variants.isEmpty()) {
+                    throw IllegalStateException("Message $messageTimestamp has no deletable variants")
+                }
+
+                if (variantIndex == 0) {
+                    val replacementVariant =
+                        variants.firstOrNull()
+                            ?: throw IllegalStateException(
+                                "Message $messageTimestamp has no replacement variant",
+                            )
+                    val promotedBaseMessage =
+                        baseMessage.copy(
+                            sections = replacementVariant.sections,
+                            searchText = replacementVariant.searchText,
+                            roleName = replacementVariant.roleName.ifBlank { baseMessage.roleName },
+                            selectedVariantIndex = 0,
+                            provider = replacementVariant.provider,
+                            modelName = replacementVariant.modelName,
+                            inputTokens = replacementVariant.inputTokens,
+                            outputTokens = replacementVariant.outputTokens,
+                            cachedInputTokens = replacementVariant.cachedInputTokens,
+                            sentAt = replacementVariant.sentAt,
+                            outputDurationMs = replacementVariant.outputDurationMs,
+                            waitDurationMs = replacementVariant.waitDurationMs,
+                            completedAt = replacementVariant.completedAt,
+                        )
+                    messageDao.updateMessage(promotedBaseMessage)
+                    messageVariantDao.deleteVariant(
+                        chatId = chatId,
+                        messageTimestamp = messageTimestamp,
+                        variantIndex = replacementVariant.variantIndex,
+                    )
+                    variants
+                        .asSequence()
+                        .filter { it.variantIndex > replacementVariant.variantIndex }
+                        .forEach { variant ->
+                            messageVariantDao.updateVariant(
+                                variant.copy(variantIndex = variant.variantIndex - 1),
+                            )
+                        }
+                } else {
+                    val targetVariant =
+                        variants.firstOrNull { it.variantIndex == variantIndex }
+                            ?: throw IllegalArgumentException(
+                                "Variant $variantIndex does not exist for message $messageTimestamp",
+                            )
+                    messageVariantDao.deleteVariant(
+                        chatId = chatId,
+                        messageTimestamp = messageTimestamp,
+                        variantIndex = targetVariant.variantIndex,
+                    )
+                    variants
+                        .asSequence()
+                        .filter { it.variantIndex > targetVariant.variantIndex }
+                        .forEach { variant ->
+                            messageVariantDao.updateVariant(
+                                variant.copy(variantIndex = variant.variantIndex - 1),
+                            )
+                        }
+                    val newSelectedVariantIndex =
+                        when {
+                            variants.any { it.variantIndex > targetVariant.variantIndex } -> targetVariant.variantIndex
+                            else -> (targetVariant.variantIndex - 1).coerceAtLeast(0)
+                        }
+                    messageDao.updateSelectedVariantIndex(
+                        chatId = chatId,
+                        timestamp = messageTimestamp,
+                        selectedVariantIndex = newSelectedVariantIndex,
+                    )
+                }
+
+                A2uiStateStore.deleteMessages(context, chatId, messageTimestamp)
+                chatDao.getChatById(chatId)?.let { chat ->
+                    chatDao.updateChatMetadata(
+                        chatId = chatId,
+                        title = chat.title,
+                        timestamp = System.currentTimeMillis(),
+                        inputTokens = chat.inputTokens,
+                        outputTokens = chat.outputTokens,
+                        currentWindowSize = chat.currentWindowSize,
+                    )
+                }
+            } catch (e: Exception) {
+                AppLogger.e(
+                    TAG,
+                    "Failed to delete variant $variantIndex for message $messageTimestamp in chat $chatId",
+                    e,
+                )
+                throw e
+            }
+        }
+    }
+
+    // 更新现有消息
+    suspend fun updateMessage(chatId: String, message: ChatMessage) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                // 找到相应的消息实体
+                val existingMessage = chatContentDao.getMessageByTimestamp(chatId, message.timestamp)
+
+                if (existingMessage != null) {
+                    if (message.selectedVariantIndex > 0) {
+                        val existingVariant =
+                            chatContentDao.getVariantForMessage(
+                                chatId,
+                                message.timestamp,
+                                message.selectedVariantIndex,
+                            ) ?: throw IllegalStateException(
+                                "Missing variant ${message.selectedVariantIndex} for message ${message.timestamp}",
+                            )
+                        messageVariantDao.updateVariant(
+                            MessageVariantEntity.fromChatMessage(
+                                chatId = chatId,
+                                messageTimestamp = message.timestamp,
+                                variantIndex = message.selectedVariantIndex,
+                                message = message,
+                                variantId = existingVariant.variantId,
+                            )
+                        )
+                        messageDao.updateSelectedVariantIndex(
+                            chatId,
+                            message.timestamp,
+                            message.selectedVariantIndex,
+                        )
+                        chatDao.getChatById(chatId)?.let { chat ->
+                            chatDao.updateChatMetadata(
+                                chatId = chatId,
+                                title = chat.title,
+                                timestamp = System.currentTimeMillis(),
+                                inputTokens = chat.inputTokens,
+                                outputTokens = chat.outputTokens,
+                                currentWindowSize = chat.currentWindowSize
+                            )
+                        }
+                        return@withLock
+                    }
+
+                    val hasNoStoredSections =
+                        existingMessage.sections.isEmpty() || existingMessage.sections == "[]"
+                    val shouldUpdateChatMetadata =
+                        message.contentStream == null ||
+                            (hasNoStoredSections && message.content.isNotEmpty())
+                    val updatedMessageEntity =
+                        MessageEntity.fromChatMessage(
+                            chatId = chatId,
+                            message = message,
+                            orderIndex = existingMessage.orderIndex,
+                            messageId = existingMessage.messageId
+                        )
+                    messageDao.updateMessage(updatedMessageEntity)
+
+                    if (shouldUpdateChatMetadata) {
+                        // 更新聊天元数据时间戳
+                        val chat = chatDao.getChatById(chatId)
+                        if (chat != null) {
+                            chatDao.updateChatMetadata(
+                                chatId = chatId,
+                                title = chat.title,
+                                timestamp = System.currentTimeMillis(),
+                                inputTokens = chat.inputTokens,
+                                outputTokens = chat.outputTokens,
+                                currentWindowSize = chat.currentWindowSize
+                            )
+                        }
+                    }
+                } else {
+                    // 如果找不到现有消息，则插入新消息（避免在同一互斥锁下递归调用 addMessage）
+                    val nextOrderIndex = (messageDao.getMaxOrderIndex(chatId) ?: -1) + 1
+                    val messageEntity = MessageEntity.fromChatMessage(
+                        chatId = chatId,
+                        message = message,
+                        orderIndex = nextOrderIndex,
+                    )
+                    messageDao.insertMessage(messageEntity)
+
+                    // 更新聊天元数据
+                    val chat = chatDao.getChatById(chatId)
+                    if (chat != null) {
+                        chatDao.updateChatMetadata(
+                            chatId = chatId,
+                            title = chat.title,
+                            timestamp = System.currentTimeMillis(),
+                            inputTokens = chat.inputTokens,
+                            outputTokens = chat.outputTokens,
+                            currentWindowSize = chat.currentWindowSize
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                throw e
+            }
+        }
+    }
+
+    suspend fun setMessageFavorite(chatId: String, timestamp: Long, isFavorite: Boolean) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                val existingMessage =
+                    chatContentDao.getMessageByTimestamp(chatId, timestamp) ?: return@withLock
+                if (existingMessage.isFavorite == isFavorite) {
+                    return@withLock
+                }
+                messageDao.updateMessageFavorite(chatId, timestamp, isFavorite)
+            } catch (e: Exception) {
+                AppLogger.e(
+                    TAG,
+                    "Failed to update favorite state for message $timestamp in chat $chatId",
+                    e,
+                )
+                throw e
+            }
+        }
+    }
+
+    suspend fun addMessageVariant(
+        chatId: String,
+        messageTimestamp: Long,
+        message: ChatMessage,
+    ): AddedMessageVariant {
+        requireNormalConversation(chatId)
+        return chatMutex(chatId).withLock {
+            val baseMessage =
+                chatContentDao.getMessageByTimestamp(chatId, messageTimestamp)
+                    ?: throw IllegalArgumentException("Message $messageTimestamp does not exist in chat $chatId")
+            if (baseMessage.sender != "ai") {
+                throw IllegalArgumentException("Only AI messages can have regenerated variants")
+            }
+            val nextVariantIndex =
+                chatContentDao.getVariantsForMessage(chatId, messageTimestamp).size + 1
+            val variant =
+                MessageVariantEntity.fromChatMessage(
+                    chatId = chatId,
+                    messageTimestamp = messageTimestamp,
+                    variantIndex = nextVariantIndex,
+                    message = message.copy(selectedVariantIndex = nextVariantIndex, variantCount = nextVariantIndex),
+                )
+            messageVariantDao.insertVariant(variant)
+            val persistedMessage = variant.applyTo(baseMessage.toChatMessage(), nextVariantIndex)
+            messageDao.updateSelectedVariantIndex(chatId, messageTimestamp, nextVariantIndex)
+            chatDao.getChatById(chatId)?.let { chat ->
+                chatDao.updateChatMetadata(
+                    chatId = chatId,
+                    title = chat.title,
+                    timestamp = System.currentTimeMillis(),
+                    inputTokens = chat.inputTokens,
+                    outputTokens = chat.outputTokens,
+                    currentWindowSize = chat.currentWindowSize
+                )
+            }
+            AddedMessageVariant(
+                selectedVariantIndex = nextVariantIndex,
+                message = persistedMessage,
+            )
+        }
+    }
+
+    suspend fun selectMessageVariant(
+        chatId: String,
+        messageTimestamp: Long,
+        selectedVariantIndex: Int,
+    ) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            chatContentDao.getMessageByTimestamp(chatId, messageTimestamp)
+                ?: throw IllegalArgumentException("Message $messageTimestamp does not exist in chat $chatId")
+            if (selectedVariantIndex > 0) {
+                chatContentDao.getVariantForMessage(chatId, messageTimestamp, selectedVariantIndex)
+                    ?: throw IllegalArgumentException(
+                        "Variant $selectedVariantIndex does not exist for message $messageTimestamp",
+                    )
+            }
+            messageDao.updateSelectedVariantIndex(chatId, messageTimestamp, selectedVariantIndex)
+        }
+    }
+
+    /**
+     * 从数据库中删除指定时间戳之后的所有消息。 这需要您在MessageDao中添加相应的@Query。
+     *
+     * 示例:
+     * ```
+     * @Query("DELETE FROM messages WHERE chatId = :chatId AND timestamp >= :timestamp")
+     * suspend fun deleteMessagesFrom(chatId: String, timestamp: Long)
+     * ```
+     */
+    suspend fun deleteMessagesFrom(chatId: String, timestamp: Long) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                AppLogger.d(TAG, "正在从数据库删除消息. ChatId: $chatId, Timestamp >=: $timestamp")
+                messageVariantDao.deleteVariantsFrom(chatId, timestamp)
+                messageDao.deleteMessagesFrom(chatId, timestamp)
+                A2uiStateStore.deleteMessages(context, chatId, timestamp, from = true)
+                AppLogger.d(TAG, "后续消息从数据库删除成功.")
+                // 更新聊天元数据时间戳
+                chatDao.getChatById(chatId)?.let { chat ->
+                    chatDao.updateChatMetadata(
+                        chatId = chatId,
+                        title = chat.title,
+                        timestamp = System.currentTimeMillis(),
+                        inputTokens = chat.inputTokens,
+                        outputTokens = chat.outputTokens,
+                        currentWindowSize = chat.currentWindowSize
+                    )
+                }
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "从 $timestamp 开始为聊天 $chatId 删除消息失败", e)
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 清除一个聊天中的所有消息，但保留聊天本身。
+     *
+     * 这需要您在MessageDao中添加相应的@Query。
+     * ```
+     * @Query("DELETE FROM messages WHERE chatId = :chatId")
+     * suspend fun deleteAllMessagesForChat(chatId: String)
+     * ```
+     */
+    suspend fun clearChatMessages(chatId: String) {
+        chatMutex(chatId).withLock {
+            requireNormalConversation(chatId)
+            SubagentCoordinator.getInstance(context).withChildrenRemoved(chatId) {
+                database.withTransaction {
+                    messageVariantDao.deleteAllVariantsForChat(chatId)
+                    messageDao.deleteAllMessagesForChat(chatId)
+                    chatDao.resetChatTokenUsage(chatId)
+                }
+                A2uiStateStore.clearChat(context, chatId)
+            }
+        }
+    }
+    // 更新聊天标题
+    suspend fun updateChatTitle(chatId: String, title: String) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                chatDao.updateChatTitle(chatId, title)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to update chat title for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    // 更新聊天绑定的角色卡
+    suspend fun updateChatCharacterCardName(chatId: String, characterCardName: String?) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                chatDao.updateChatCharacterCardName(chatId, characterCardName)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to update chat character card for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    /** 按会话 ID 直接读取统计，不依赖侧边栏列表的异步加载。 */
+    suspend fun getChatTokenCounts(chatId: String): Triple<Long, Long, Long>? =
+        withContext(Dispatchers.IO) {
+            chatDao.getChatById(chatId)?.let { chat ->
+                Triple(chat.inputTokens, chat.outputTokens, chat.currentWindowSize)
+            }
+        }
+
+    // 保存普通累计快照；消息清空仍使用独立的元数据更新操作。
+    suspend fun updateChatTokenCounts(
+        chatId: String,
+        inputTokens: Long,
+        outputTokens: Long,
+        currentWindowSize: Long,
+        usageBreakdown: TokenUsageBreakdown? = null,
+    ) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            database.withTransaction {
+                val previous = chatDao.getChatById(chatId) ?: return@withTransaction
+                val usage = TokenUsageBreakdown.advance(
+                    previous.usageBreakdownJson, previous.inputTokens, previous.outputTokens,
+                    inputTokens.coerceAtLeast(0L), outputTokens.coerceAtLeast(0L), usageBreakdown,
+                )
+                chatDao.updateChatTokenUsage(
+                    chatId = chatId,
+                    inputTokens = inputTokens.coerceAtLeast(0L),
+                    outputTokens = outputTokens.coerceAtLeast(0L),
+                    currentWindowSize = currentWindowSize.coerceAtLeast(0L),
+                    usageBreakdownJson = usage.encode(),
+                )
+            }
+        }
+    }
+    /** 仅保存上下文窗口，保留当前累计用量。 */
+    suspend fun updateChatContextWindow(chatId: String, windowSize: Long) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            chatDao.updateChatContextWindow(chatId, windowSize.coerceAtLeast(0L))
+        }
+    }
+
+    // 设置当前聊天ID
+    suspend fun markChatUsed(chatId: String, timestamp: Long = System.currentTimeMillis()) {
+        chatDao.markChatUsed(chatId, timestamp)
+    }
+
+    suspend fun setCurrentChatId(chatId: String) {
+        requireNormalConversation(chatId)
+        markChatUsed(chatId)
+        context.currentChatIdDataStore.edit { preferences ->
+            preferences[PreferencesKeys.CURRENT_CHAT_ID] = chatId
+        }
+    }
+
+    // 清除当前聊天ID
+    suspend fun clearCurrentChatId() {
+        context.currentChatIdDataStore.edit { preferences ->
+            preferences.remove(PreferencesKeys.CURRENT_CHAT_ID)
+        }
+    }
+
+    // 检查聊天是否存在
+    /** 子会话只接受协调器的事务写入，普通聊天发送、编辑和开场白不能改写它。 */
+    suspend fun isSubagentConversation(chatId: String): Boolean = withContext(Dispatchers.IO) {
+        chatDao.getChatById(chatId)?.chatKind == ChatKind.SUBAGENT
+    }
+
+    suspend fun requireNormalConversation(chatId: String) = withContext(Dispatchers.IO) {
+        val chat = chatDao.getChatById(chatId)
+        check(chat == null || chat.chatKind == ChatKind.NORMAL) { "Use the parent task to manage this subagent conversation" }
+    }
+
+    /** 任务生命周期不能把数据库读取失败当成聊天已删除。 */
+    suspend fun chatExistsOrThrow(chatId: String): Boolean = withContext(Dispatchers.IO) {
+        chatDao.getChatById(chatId) != null
+    }
+
+    /** 投递恢复只确认待处理标记；数据库错误必须传播，不能按未投递重复发送。 */
+    suspend fun loadPersistedAgentMarkersOrThrow(chatId: String, markers: Set<String>): Set<String> =
+        withContext(Dispatchers.IO) {
+            messageDao.findPersistedAgentMessageMarkers(chatId, markers)
+        }
+
+    suspend fun chatExists(chatId: String): Boolean {
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                chatDao.getChatById(chatId) != null
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to check chat existence for chat $chatId", e)
+                false
+            }
+        }
+    }
+
+    suspend fun canDeleteChatHistory(chatId: String): Boolean =
+        getChatDeletionBlockReason(chatId) == null
+
+    /** 每次读取目标会话，准备删除时允许当前会话先完成切换。 */
+    suspend fun getChatDeletionBlockReason(
+        chatId: String,
+        allowCurrentChat: Boolean = false,
+    ): ChatDeletionResult? = withContext(Dispatchers.IO) {
+        try {
+            val target = chatDao.getChatById(chatId)
+            if (target?.chatKind == ChatKind.SUBAGENT) return@withContext ChatDeletionResult.FAILED
+            ChatDeletionPolicy.blockReason(
+                target = target,
+                currentChatId = currentChatIdFlow.first(),
+                allowCurrentChat = allowCurrentChat,
+            )
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            AppLogger.e(TAG, "检查会话删除权限失败：$chatId", error)
+            ChatDeletionResult.FAILED
+        }
+    }
+
+    // 删除聊天历史
+    suspend fun deleteChatHistory(chatId: String): Boolean = deleteOrdinaryChat(chatId, allowCurrentChat = false)
+
+    private suspend fun deleteOrdinaryChat(chatId: String, allowCurrentChat: Boolean): Boolean =
+        chatMutex(chatId).withLock {
+            val target = chatDao.getChatById(chatId)
+            if (target?.chatKind == ChatKind.SUBAGENT) return@withLock false
+            val blocked = ChatDeletionPolicy.blockReason(target, currentChatIdFlow.first(), allowCurrentChat)
+            if (blocked != null) {
+                AppLogger.w(TAG, "拒绝删除会话：$chatId，原因：$blocked")
+                return@withLock false
+            }
+            SubagentCoordinator.getInstance(context).withChildrenRemoved(chatId) {
+                database.withTransaction { chatDao.deleteChat(chatId) }
+                chatDraftRepository.removeDraft(chatId)
+                A2uiStateStore.deleteChat(context, chatId)
+                true
+            }
+        }
+    // 创建新对话
+    suspend fun createNewChat(
+        group: String? = null,
+        inheritGroupFromChatId: String? = null,
+        characterCardName: String? = null,
+        characterGroupId: String? = null,
+        setAsCurrentChat: Boolean = true,
+        folderId: String? = null
+    ): ChatHistory {
+        val dateTime = LocalDateTime.now()
+        val formattedTime =
+            "${dateTime.hour}:${
+                dateTime.minute.toString().padStart(2, '0')
+            }:${dateTime.second.toString().padStart(2, '0')}"
+
+        val localizedContext = LocaleUtils.getLocalizedContext(context)
+
+        val inherited = inheritGroupFromChatId?.let { chatDao.getChatById(it) }
+        val folder = when {
+            folderId != null -> chatFolders.getFolder(folderId)
+            group != null -> chatFolders.ensureLegacyRoot(group, ChatFolderBinding(characterCardName, characterGroupId))
+            inherited?.folderId != null -> chatFolders.getFolder(inherited.folderId)
+            else -> null
+        }
+
+        val newHistory =
+            ChatHistory(
+                title = "${localizedContext.getString(R.string.new_conversation)} $formattedTime",
+                messages = listOf<ChatMessage>(),
+                inputTokens = 0,
+                outputTokens = 0,
+                group = folder?.name,
+                folderId = folder?.id,
+                lastUsedAt = System.currentTimeMillis(),
+                displayOrder = -System.currentTimeMillis(),
+                characterCardName = characterCardName, // 使用传入的角色卡名称，如果为null则不绑定
+                characterGroupId = characterGroupId // 绑定群组角色卡ID（可选）
+            )
+
+        // 保存新聊天
+        val chatEntity = ChatEntity.fromChatHistory(newHistory)
+        chatDao.insertChat(chatEntity)
+
+        // 设置为当前聊天
+        if (setAsCurrentChat) {
+            setCurrentChatId(newHistory.id)
+        }
+
+        return newHistory
+    }
+
+    /** 更新聊天工作区 */
+    suspend fun updateChatWorkspace(chatId: String, workspace: String?, workspaceEnv: String?) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                chatDao.updateChatWorkspace(chatId, workspace, workspaceEnv)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to update chat workspace for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    suspend fun renameManagedWorkspace(
+        chatId: String,
+        newWorkspaceName: String
+    ): WorkspaceRenameResult {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            val trimmedName = newWorkspaceName.trim()
+            if (trimmedName.isEmpty()) {
+                throw IllegalArgumentException(context.getString(R.string.workspace_rename_name_empty))
+            }
+            if (
+                trimmedName == "." ||
+                trimmedName == ".." ||
+                trimmedName.contains('/') ||
+                trimmedName.contains('\\')
+            ) {
+                throw IllegalArgumentException(context.getString(R.string.workspace_rename_name_invalid))
+            }
+
+            val chat = chatDao.getChatById(chatId)
+                ?: throw IllegalStateException(context.getString(R.string.workspace_rename_chat_missing))
+            val workspacePath = chat.workspace
+                ?: throw IllegalStateException(context.getString(R.string.chat_not_bound_to_workspace))
+            if (!chat.workspaceEnv.isNullOrBlank()) {
+                throw IllegalStateException(
+                    context.getString(R.string.workspace_rename_only_managed_supported)
+                )
+            }
+
+            val workspaceRoot = File(context.filesDir, "workspace").apply { mkdirs() }.canonicalFile
+            val sourceDir = File(workspacePath).canonicalFile
+            if (!sourceDir.exists() || !sourceDir.isDirectory) {
+                throw IllegalStateException(context.getString(R.string.workspace_directory_invalid))
+            }
+            if (sourceDir.parentFile?.canonicalFile != workspaceRoot) {
+                throw IllegalStateException(
+                    context.getString(R.string.workspace_rename_only_managed_supported)
+                )
+            }
+
+            val targetDir = File(workspaceRoot, trimmedName).canonicalFile
+            if (targetDir.parentFile?.canonicalFile != workspaceRoot) {
+                throw IllegalArgumentException(context.getString(R.string.workspace_rename_name_invalid))
+            }
+            if (targetDir != sourceDir && targetDir.exists()) {
+                throw IllegalArgumentException(context.getString(R.string.workspace_rename_name_exists))
+            }
+
+            if (targetDir != sourceDir && !sourceDir.renameTo(targetDir)) {
+                throw IOException(context.getString(R.string.workspace_rename_failed))
+            }
+
+            chatDao.updateChatTitleAndWorkspace(
+                chatId = chatId,
+                title = trimmedName,
+                workspace = targetDir.absolutePath,
+                workspaceEnv = chat.workspaceEnv
+            )
+
+            return WorkspaceRenameResult(
+                workspacePath = targetDir.absolutePath,
+                workspaceEnv = chat.workspaceEnv,
+                workspaceName = trimmedName
+            )
+        }
+    }
+
+    // 更新聊天分组
+    suspend fun updateChatGroup(chatId: String, group: String?) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                val folderId = group?.let { chatFolders.ensureLegacyRoot(it, ChatFolderBinding(null, null)).id }
+                chatFolders.assignChats(listOf(chatId), folderId)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to update chat group for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    suspend fun getChatTitle(chatId: String): String? {
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                chatDao.getChatById(chatId)?.title
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to get chat title for chat $chatId", e)
+                null
+            }
+        }
+    }
+
+    // 直接加载聊天消息
+    suspend fun loadChatMessages(chatId: String): List<ChatMessage> {
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                // AppLogger.d(TAG, "直接从数据库加载聊天 $chatId 的消息")
+                val messageEntities = chatContentDao.getMessagesForChat(chatId)
+                // AppLogger.d(TAG, "聊天 $chatId 共加载 ${messages.size} 条消息")
+                hydrateMessages(chatId, messageEntities)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "加载聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun loadChatMessages(
+        chatId: String,
+        order: String? = null,
+        limit: Int? = null
+    ): List<ChatMessage> {
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                val normalizedOrder = order?.trim()?.lowercase()
+                val effectiveLimit = limit?.coerceAtLeast(1)
+
+                val messageEntities = when (normalizedOrder) {
+                    "desc" -> {
+                        if (effectiveLimit != null) {
+                            chatContentDao.getMessagesForChatDesc(chatId, effectiveLimit)
+                        } else {
+                            chatContentDao.getMessagesForChat(chatId).asReversed()
+                        }
+                    }
+
+                    else -> {
+                        if (effectiveLimit != null) {
+                            chatContentDao.getMessagesForChatAsc(chatId, effectiveLimit)
+                        } else {
+                            chatContentDao.getMessagesForChat(chatId)
+                        }
+                    }
+                }
+
+                hydrateMessages(chatId, messageEntities)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "加载聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun loadChatMessagesRange(
+        chatId: String,
+        order: String? = null,
+        start: Int,
+        end: Int,
+    ): List<ChatMessage> {
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                val normalizedOrder = order?.trim()?.lowercase()
+                val limit = end - start + 1
+
+                val messageEntities = when (normalizedOrder) {
+                    "desc" -> chatContentDao.getMessagesForChatDescRange(chatId, start, limit)
+                    else -> chatContentDao.getMessagesForChatAscRange(chatId, start, limit)
+                }
+
+                hydrateMessages(chatId, messageEntities)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "按区间加载聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    /** 搜索包含特定关键词的聊天ID列表 */
+    suspend fun searchChatIdsByContent(query: String): Set<String> {
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                if (query.isBlank()) {
+                    return@withContext emptySet()
+                }
+                val escapedQuery =
+                    query
+                        .trim()
+                        .replace("\\", "\\\\")
+                        .replace("%", "\\%")
+                        .replace("_", "\\_")
+
+                val chatIds = messageDao.searchChatIdsByContent(escapedQuery)
+                chatIds.toSet()
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "搜索聊天内容失败: $query", e)
+                emptySet()
+            }
+        }
+    }
+
+    /**
+     * 创建对话分支
+     * @param parentChatId 父对话ID
+     * @param upToMessageTimestamp 复制消息到指定时间戳（包含该时间戳的消息）
+     * @return 新创建的分支对话
+     */
+    suspend fun createBranch(
+        parentChatId: String,
+        upToMessageTimestamp: Long? = null
+    ): ChatHistory {
+        requireNormalConversation(parentChatId)
+        return globalMutex.withLock {
+            try {
+                // 获取父对话
+                val parentChat = chatDao.getChatById(parentChatId)
+                    ?: throw IllegalArgumentException(context.getString(R.string.chat_history_parent_not_exist, parentChatId))
+
+                val branchEntity =
+                    ChatEntity(
+                        title = parentChat.title,
+                        inputTokens = parentChat.inputTokens,
+                        outputTokens = parentChat.outputTokens,
+                        currentWindowSize = parentChat.currentWindowSize,
+                        usageBreakdownJson = parentChat.usageBreakdownJson,
+                        group = parentChat.group,
+                        folderId = parentChat.folderId,
+                        lastUsedAt = System.currentTimeMillis(),
+                        workspace = parentChat.workspace,
+                        workspaceEnv = parentChat.workspaceEnv,
+                        parentChatId = parentChatId,
+                        chatKind = ChatKind.NORMAL,
+                        characterCardName = parentChat.characterCardName,
+                        characterGroupId = parentChat.characterGroupId,
+                        locked = false,
+                        pinned = false,
+                    )
+
+                chatDao.insertChat(branchEntity)
+
+                val copiedMessageCount =
+                    messageDao.countMessagesForChatUpToTimestamp(parentChatId, upToMessageTimestamp)
+                if (copiedMessageCount > 0) {
+                    messageDao.copyMessagesToChat(
+                        sourceChatId = parentChatId,
+                        targetChatId = branchEntity.id,
+                        upToTimestampInclusive = upToMessageTimestamp,
+                    )
+                    messageVariantDao.copyVariantsToChat(
+                        sourceChatId = parentChatId,
+                        targetChatId = branchEntity.id,
+                        upToTimestampInclusive = upToMessageTimestamp,
+                    )
+                }
+
+                A2uiStateStore.copyChat(context, parentChatId, branchEntity.id, upToMessageTimestamp)
+                val branchHistory = branchEntity.toChatHistory(emptyList())
+
+                // 设置为当前聊天
+                setCurrentChatId(branchHistory.id)
+
+                AppLogger.d(
+                    TAG,
+                    "创建分支对话: ${branchHistory.id}, 父对话: $parentChatId, 消息数: $copiedMessageCount"
+                )
+                branchHistory
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "创建分支对话失败", e)
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 获取指定对话的所有分支
+     * @param parentChatId 父对话ID
+     * @return 分支对话列表
+     */
+    suspend fun getBranches(parentChatId: String): List<ChatHistory> {
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                val branchEntities = chatDao.getBranchesByParentId(parentChatId)
+                branchEntities.map { entity ->
+                    val createdAt = Instant.ofEpochMilli(entity.createdAt)
+                        .atZone(ZoneId.systemDefault())
+                        .toLocalDateTime()
+                    val updatedAt = Instant.ofEpochMilli(entity.updatedAt)
+                        .atZone(ZoneId.systemDefault())
+                        .toLocalDateTime()
+
+                    ChatHistory(
+                        id = entity.id,
+                        title = entity.title,
+                        messages = emptyList(), // 不加载消息以提高性能
+                        createdAt = createdAt,
+                        updatedAt = updatedAt,
+                        inputTokens = entity.inputTokens,
+                        outputTokens = entity.outputTokens,
+                        currentWindowSize = entity.currentWindowSize,
+                        usageBreakdownJson = entity.usageBreakdownJson,
+                        group = entity.group,
+                        displayOrder = entity.displayOrder,
+                        workspace = entity.workspace,
+                        parentChatId = entity.parentChatId,
+                        characterCardName = entity.characterCardName,
+                        characterGroupId = entity.characterGroupId,
+                        locked = entity.locked,
+                        folderId = entity.folderId,
+                        lastUsedAt = entity.lastUsedAt,
+                        pinned = entity.pinned,
+                        archived = entity.archived
+                    )
+                }
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "获取分支对话失败: $parentChatId", e)
+                emptyList()
+            }
+        }
+    }
+
+    /**
+     * 获取指定对话的所有分支（Flow版本）
+     * @param parentChatId 父对话ID
+     * @return 分支对话Flow
+     */
+    fun getBranchesFlow(parentChatId: String): Flow<List<ChatHistory>> {
+        return chatDao.getBranchesByParentIdFlow(parentChatId).map { branchEntities ->
+            branchEntities.map { entity ->
+                val createdAt = Instant.ofEpochMilli(entity.createdAt)
+                    .atZone(ZoneId.systemDefault())
+                    .toLocalDateTime()
+                val updatedAt = Instant.ofEpochMilli(entity.updatedAt)
+                    .atZone(ZoneId.systemDefault())
+                    .toLocalDateTime()
+
+                ChatHistory(
+                    id = entity.id,
+                    title = entity.title,
+                    messages = emptyList(), // 不加载消息以提高性能
+                    createdAt = createdAt,
+                    updatedAt = updatedAt,
+                    inputTokens = entity.inputTokens,
+                    outputTokens = entity.outputTokens,
+                    currentWindowSize = entity.currentWindowSize,
+                    usageBreakdownJson = entity.usageBreakdownJson,
+                    group = entity.group,
+                    displayOrder = entity.displayOrder,
+                    workspace = entity.workspace,
+                    parentChatId = entity.parentChatId,
+                    characterCardName = entity.characterCardName,
+                    characterGroupId = entity.characterGroupId,
+                    locked = entity.locked,
+                    folderId = entity.folderId,
+                    lastUsedAt = entity.lastUsedAt,
+                    pinned = entity.pinned,
+                    archived = entity.archived
+                )
+            }
+        }
+    }
+
+    /**
+     * 导出指定聊天记录到「下载/Operit」目录。
+     * @param selectedChatIds 要导出的聊天记录 ID，不能为空
+     * @param format 导出格式
+     * @param onProgress 超长文本导出进度回调
+     * @return 导出结果，失败时返回null
+     */
+    suspend fun exportChatHistoriesToDownloads(
+        selectedChatIds: Set<String>,
+        format: ExportFormat,
+        onProgress: ((ChatExportProgress) -> Unit)?,
+    ): ChatExportResult? =
+        withContext(Dispatchers.IO) {
+            var pendingExportFile: File? = null
+            try {
+                require(selectedChatIds.isNotEmpty()) { "At least one chat must be selected for export." }
+                val chatHistoriesBasic = chatHistoriesFlow.first().filter { it.id in selectedChatIds }
+                if (chatHistoriesBasic.isEmpty()) {
+                    AppLogger.w(TAG, "所选聊天记录已不存在，取消导出")
+                    return@withContext null
+                }
+                val exportedChatIds = chatHistoriesBasic.map { it.id }.toSet()
+                val contentCharacterCountsByChat = when (format) {
+                    ExportFormat.JSON, ExportFormat.CSV ->
+                        chatContentDao.getArchiveContentCharacterCountsByChat()
+                    ExportFormat.MARKDOWN, ExportFormat.HTML, ExportFormat.TXT ->
+                        chatContentDao.getSelectedContentCharacterCountsByChat()
+                }.filter { it.chatId in exportedChatIds }
+                val totalTextCharacters = contentCharacterCountsByChat.sumOf { it.contentCharacterCount }
+                val useStreamingProgress =
+                    totalTextCharacters >= TEXT_EXPORT_STREAMING_THRESHOLD_CHARACTER_COUNT
+                val totalMessageCount = if (useStreamingProgress) {
+                    messageDao.getMessageCountsByChatId()
+                        .filter { it.chatId in exportedChatIds }
+                        .sumOf { it.count }
+                } else {
+                    0
+                }
+                val messageCountsByChatId: Map<String, Int> = if (format == ExportFormat.MARKDOWN) {
+                    messageDao.getMessageCountsByChatId().associate { it.chatId to it.count }
+                } else {
+                    emptyMap()
+                }
+
+                if (useStreamingProgress) {
+                    onProgress?.invoke(
+                        ChatExportProgress(
+                            isLongText = true,
+                            progress = 0f,
+                            processedCharacters = 0L,
+                            totalCharacters = totalTextCharacters,
+                        )
+                    )
+                }
+                val streamingProgressCallback = onProgress.takeIf { useStreamingProgress }
+
+                val exportDir = OperitBackupDirs.chatDir()
+                val dateFormat = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.getDefault())
+                val timestamp = dateFormat.format(Date())
+
+                val exportFile = when (format) {
+                    ExportFormat.MARKDOWN -> {
+                        val zipFile = File(exportDir, "chat_backup_$timestamp.zip")
+                        pendingExportFile = zipFile
+                        exportMarkdownHistoriesStream(
+                            file = zipFile,
+                            chatHistories = chatHistoriesBasic,
+                            messageCountsByChatId = messageCountsByChatId,
+                            totalTextCharacters = totalTextCharacters,
+                            onProgress = streamingProgressCallback,
+                        )
+                        zipFile
+                    }
+
+                    ExportFormat.JSON -> {
+                        val file = File(exportDir, "chat_backup_$timestamp.json")
+                        pendingExportFile = file
+                        exportOperitArchiveJsonStream(
+                            file = file,
+                            chatHistories = chatHistoriesBasic,
+                            totalTextCharacters = totalTextCharacters,
+                            onProgress = streamingProgressCallback,
+                        )
+                        file
+                    }
+
+                    ExportFormat.HTML -> {
+                        val file = File(exportDir, "chat_backup_$timestamp.html")
+                        pendingExportFile = file
+                        if (useStreamingProgress) {
+                            exportLongTextHistories(
+                                file = file,
+                                format = format,
+                                chatHistories = chatHistoriesBasic,
+                                totalMessageCount = totalMessageCount,
+                                totalTextCharacters = totalTextCharacters,
+                                onProgress = onProgress,
+                            )
+                        } else {
+                            val completeHistories = loadDisplayHistories(chatHistoriesBasic)
+                            file.writeText(HtmlExporter.exportMultiple(context, completeHistories))
+                        }
+                        file
+                    }
+
+                    ExportFormat.TXT -> {
+                        val file = File(exportDir, "chat_backup_$timestamp.txt")
+                        pendingExportFile = file
+                        if (useStreamingProgress) {
+                            exportLongTextHistories(
+                                file = file,
+                                format = format,
+                                chatHistories = chatHistoriesBasic,
+                                totalMessageCount = totalMessageCount,
+                                totalTextCharacters = totalTextCharacters,
+                                onProgress = onProgress,
+                            )
+                        } else {
+                            val completeHistories = loadDisplayHistories(chatHistoriesBasic)
+                            file.writeText(TextExporter.exportMultiple(context, completeHistories))
+                        }
+                        file
+                    }
+
+                    ExportFormat.CSV -> {
+                        val file = File(exportDir, "chat_backup_$timestamp.csv")
+                        pendingExportFile = file
+                        exportCsvHistoriesStream(
+                            file = file,
+                            chatHistories = chatHistoriesBasic,
+                            totalTextCharacters = totalTextCharacters,
+                            onProgress = streamingProgressCallback,
+                        )
+                        file
+                    }
+                }
+
+                pendingExportFile = null
+                ChatExportResult(
+                    filePath = exportFile.absolutePath,
+                    chatCount = chatHistoriesBasic.size,
+                )
+            } catch (e: Exception) {
+                pendingExportFile?.let { incompleteFile ->
+                    if (incompleteFile.exists() && !incompleteFile.delete()) {
+                        AppLogger.w(TAG, "无法删除未完成的聊天导出文件: ${incompleteFile.absolutePath}")
+                    }
+                }
+                AppLogger.e(TAG, "导出聊天记录失败", e)
+                null
+            }
+        }
+
+    private suspend fun exportMarkdownHistoriesStream(
+        file: File,
+        chatHistories: List<ChatHistory>,
+        messageCountsByChatId: Map<String, Int>,
+        totalTextCharacters: Long,
+        onProgress: ((ChatExportProgress) -> Unit)?,
+    ) {
+        val progressReporter = ChatExportProgressReporter(totalTextCharacters, onProgress)
+        ZipOutputStream(
+            BufferedOutputStream(
+                FileOutputStream(file),
+                TEXT_EXPORT_WRITER_BUFFER_SIZE,
+            )
+        ).use { zipStream ->
+            val writer = BufferedWriter(
+                OutputStreamWriter(zipStream, StandardCharsets.UTF_8),
+                TEXT_EXPORT_WRITER_BUFFER_SIZE,
+            )
+            val usedNames = HashSet<String>()
+            for (chatHistoryBasic in chatHistories) {
+                var safeTitle = chatHistoryBasic.title.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                if (safeTitle.length > 50) {
+                    safeTitle = safeTitle.substring(0, 50)
+                }
+                safeTitle = safeTitle.trim()
+
+                var baseName = "$safeTitle.md"
+                var counter = 1
+                while (usedNames.contains(baseName)) {
+                    baseName = "$safeTitle ($counter).md"
+                    counter++
+                }
+                usedNames.add(baseName)
+
+                zipStream.putNextEntry(ZipEntry(baseName))
+                MarkdownExporter.writeSingleHeaderToWriter(
+                    context = context,
+                    chatHistory = chatHistoryBasic,
+                    writer = writer,
+                    messageCount = messageCountsByChatId[chatHistoryBasic.id] ?: 0,
+                )
+
+                var offset = 0
+                while (true) {
+                    val messagePage = chatContentDao.getMessagesForChatAscRange(
+                        chatId = chatHistoryBasic.id,
+                        offset = offset,
+                        limit = MESSAGE_EXPORT_PAGE_SIZE,
+                    )
+                    if (messagePage.isEmpty()) {
+                        break
+                    }
+
+                    val variants =
+                        chatContentDao
+                            .getVariantsForMessages(
+                                chatHistoryBasic.id,
+                                messagePage.map { it.timestamp },
+                            )
+                    val hydratedMessages = hydrateMessages(messagePage, variants)
+                    for (index in messagePage.indices) {
+                        MarkdownExporter.writeMessageToWriter(
+                            writer = writer,
+                            message = hydratedMessages[index],
+                            onContentCharactersWritten = progressReporter::add,
+                        )
+                    }
+
+                    offset += messagePage.size
+                    writer.flush()
+                    yield()
+                }
+
+                writer.flush()
+                zipStream.closeEntry()
+            }
+        }
+        progressReporter.finish()
+    }
+
+    private suspend fun exportCsvHistoriesStream(
+        file: File,
+        chatHistories: List<ChatHistory>,
+        totalTextCharacters: Long,
+        onProgress: ((ChatExportProgress) -> Unit)?,
+    ) {
+        val exportedFolders = chatFolders.exportFolders(chatHistories.map { it.id }.toSet())
+        val foldersById = exportedFolders.associateBy { it.id }
+        val progressReporter = ChatExportProgressReporter(totalTextCharacters, onProgress)
+        BufferedWriter(
+            OutputStreamWriter(FileOutputStream(file), StandardCharsets.UTF_8),
+            TEXT_EXPORT_WRITER_BUFFER_SIZE,
+        ).use { writer ->
+            ChatHistoryCsv.writeHeader(writer)
+            exportedFolders.forEach { ChatHistoryCsv.writeFolder(writer, it) }
+            for (chatHistory in chatHistories) {
+                ChatHistoryCsv.writeChat(
+                    writer,
+                    OperitArchivedChat.fromChatHistory(chatHistory, emptyList()).copy(
+                        folderPath = folderAncestors(chatHistory.folderId, foldersById),
+                    ),
+                )
+                var offset = 0
+                while (true) {
+                    val messagePage = chatContentDao.getMessagesForChatAscRange(
+                        chatId = chatHistory.id,
+                        offset = offset,
+                        limit = MESSAGE_EXPORT_PAGE_SIZE,
+                    )
+                    if (messagePage.isEmpty()) {
+                        break
+                    }
+
+                    val variantsByTimestamp =
+                        chatContentDao
+                            .getVariantsForMessages(
+                                chatHistory.id,
+                                messagePage.map { it.timestamp },
+                            )
+                            .groupBy { it.messageTimestamp }
+                    messagePage.forEachIndexed { pageIndex, messageEntity ->
+                        val variants = variantsByTimestamp[messageEntity.timestamp].orEmpty()
+                        val message = messageEntity.toChatMessage().copy(
+                            variantCount = variants.size + 1,
+                        )
+                        ChatHistoryCsv.writeMessage(
+                            writer = writer,
+                            chatId = chatHistory.id,
+                            orderIndex = offset + pageIndex,
+                            message = message,
+                        )
+                        progressReporter.add(message.content.length.toLong())
+                        for (variant in variants) {
+                            ChatHistoryCsv.writeVariant(
+                                writer = writer,
+                                chatId = chatHistory.id,
+                                messageTimestamp = message.timestamp,
+                                variant = OperitArchivedMessageVariant.fromEntity(variant),
+                            )
+                            progressReporter.add(MessageSectionCodec.render(MessageSectionStorage.decode(variant.sections, variant.searchText)).length.toLong())
+                        }
+                    }
+
+                    offset += messagePage.size
+                    writer.flush()
+                    yield()
+                }
+            }
+        }
+        progressReporter.finish()
+    }
+
+    private suspend fun exportLongTextHistories(
+        file: File,
+        format: ExportFormat,
+        chatHistories: List<ChatHistory>,
+        totalMessageCount: Int,
+        totalTextCharacters: Long,
+        onProgress: ((ChatExportProgress) -> Unit)?,
+    ) {
+        check(format == ExportFormat.HTML || format == ExportFormat.TXT)
+
+        var processedCharacters = 0L
+        var lastReportedCharacters = 0L
+
+        fun reportProgress(force: Boolean = false) {
+            val clampedProcessedCharacters = processedCharacters.coerceAtMost(totalTextCharacters)
+            val shouldReport =
+                force ||
+                    clampedProcessedCharacters - lastReportedCharacters >=
+                        TEXT_EXPORT_PROGRESS_UPDATE_CHARACTER_COUNT
+            if (!shouldReport) {
+                return
+            }
+
+            lastReportedCharacters = clampedProcessedCharacters
+            val progress = if (totalTextCharacters == 0L) {
+                1f
+            } else {
+                clampedProcessedCharacters.toFloat() / totalTextCharacters.toFloat()
+            }
+            onProgress?.invoke(
+                ChatExportProgress(
+                    isLongText = true,
+                    progress = progress.coerceIn(0f, 1f),
+                    processedCharacters = clampedProcessedCharacters,
+                    totalCharacters = totalTextCharacters,
+                )
+            )
+        }
+
+        BufferedWriter(
+            OutputStreamWriter(FileOutputStream(file), StandardCharsets.UTF_8),
+            TEXT_EXPORT_WRITER_BUFFER_SIZE,
+        ).use { writer ->
+            when (format) {
+                ExportFormat.HTML ->
+                    HtmlExporter.writeMultipleHeader(
+                        context = context,
+                        chatHistories = chatHistories,
+                        totalMessageCount = totalMessageCount,
+                        writer = writer,
+                    )
+
+                ExportFormat.TXT ->
+                    TextExporter.writeMultipleHeader(
+                        context = context,
+                        chatHistories = chatHistories,
+                        totalMessageCount = totalMessageCount,
+                        writer = writer,
+                    )
+
+                ExportFormat.JSON, ExportFormat.MARKDOWN, ExportFormat.CSV -> check(false)
+            }
+
+            chatHistories.forEachIndexed { index, chatHistoryBasic ->
+                when (format) {
+                    ExportFormat.HTML -> HtmlExporter.writeConversationSeparator(writer, index)
+                    ExportFormat.TXT -> TextExporter.writeConversationSeparator(writer, index)
+                    ExportFormat.JSON, ExportFormat.MARKDOWN, ExportFormat.CSV -> check(false)
+                }
+
+                val completeHistory = loadDisplayHistory(chatHistoryBasic)
+                val onContentCharactersWritten: (Long) -> Unit = { characterCount ->
+                    processedCharacters += characterCount
+                    reportProgress()
+                }
+                when (format) {
+                    ExportFormat.HTML ->
+                        HtmlExporter.writeConversationToWriter(
+                            context = context,
+                            writer = writer,
+                            chatHistory = completeHistory,
+                            onContentCharactersWritten = onContentCharactersWritten,
+                        )
+
+                    ExportFormat.TXT ->
+                        TextExporter.writeSingleToWriter(
+                            context = context,
+                            chatHistory = completeHistory,
+                            writer = writer,
+                            onContentCharactersWritten = onContentCharactersWritten,
+                        )
+
+                    ExportFormat.JSON, ExportFormat.MARKDOWN, ExportFormat.CSV -> check(false)
+                }
+                writer.flush()
+                reportProgress(force = true)
+                yield()
+            }
+
+            when (format) {
+                ExportFormat.HTML -> HtmlExporter.writeMultipleFooter(context, writer)
+                ExportFormat.TXT -> TextExporter.writeMultipleFooter(context, writer)
+                ExportFormat.JSON, ExportFormat.MARKDOWN, ExportFormat.CSV -> check(false)
+            }
+        }
+
+        processedCharacters = totalTextCharacters
+        reportProgress(force = true)
+    }
+
+    /**
+     * 从指定URI导入聊天记录（指定格式）
+     * @param uri 备份文件URI
+     * @param format 指定的格式
+     * @return 导入结果统计
+     */
+    suspend fun importChatHistoriesFromUri(uri: Uri, format: ChatFormat): ChatImportResult =
+        withContext(Dispatchers.IO) {
+            try {
+                val chatHistories = mutableListOf<ChatHistory>()
+                var isZipProcessed = false
+
+                // 如果是 Markdown 格式，尝试作为 Zip 处理
+                if (format == ChatFormat.MARKDOWN) {
+                    try {
+                        context.contentResolver.openInputStream(uri)?.use { fis ->
+                            // 尝试作为 Zip 读取
+                            // 注意：ZipInputStream 可能会消耗流，如果不是 Zip，后续重读需要重新 openInputStream
+                            ZipInputStream(fis).use { zipStream ->
+                                var entry = zipStream.nextEntry
+                                if (entry != null) {
+                                    // 确实是 Zip 文件
+                                    do {
+                                        if (!entry.isDirectory && entry.name.lowercase().endsWith(".md")) {
+                                            val buffer = ByteArrayOutputStream()
+                                            val data = ByteArray(4096)
+                                            var count: Int
+                                            while (zipStream.read(data).also { count = it } != -1) {
+                                                buffer.write(data, 0, count)
+                                            }
+                                            val content = buffer.toString("UTF-8")
+                                            if (content.isNotBlank()) {
+                                                chatHistories.addAll(convertToOperitFormat(content, ChatFormat.MARKDOWN))
+                                            }
+                                        }
+                                        zipStream.closeEntry()
+                                        entry = zipStream.nextEntry
+                                    } while (entry != null)
+                                    isZipProcessed = true
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        AppLogger.w(TAG, "尝试解析 Zip 失败，将尝试作为普通文件读取: ${e.message}")
+                    }
+                }
+
+                if (!isZipProcessed) {
+                    AppLogger.d(TAG, "使用指定格式导入: $format")
+                    if (format == ChatFormat.OPERIT) {
+                        val existingIds = chatHistoriesFlow.first().map { it.id }.toMutableSet()
+                        val inputStream =
+                            context.contentResolver.openInputStream(uri)
+                                ?: return@withContext ChatImportResult(0, 0, 0)
+                        inputStream.use { stream ->
+                            AppLogger.d(TAG, "开始流式导入 Operit JSON: uri=$uri")
+                            return@withContext importOperitChatHistoriesStream(stream, existingIds)
+                        }
+                    } else if (format == ChatFormat.CSV) {
+                        val existingIds = chatHistoriesFlow.first().map { it.id }.toMutableSet()
+                        val inputStream =
+                            context.contentResolver.openInputStream(uri)
+                                ?: return@withContext ChatImportResult(0, 0, 0)
+                        inputStream.use { stream ->
+                            AppLogger.d(TAG, "开始流式导入 Operit CSV: uri=$uri")
+                            return@withContext importCsvChatHistoriesStream(stream, existingIds)
+                        }
+                    } else {
+                        val inputStream = context.contentResolver.openInputStream(uri)
+                            ?: return@withContext ChatImportResult(0, 0, 0)
+                        val content = inputStream.bufferedReader().use { it.readText() }
+
+                        if (content.isBlank()) {
+                            throw Exception(context.getString(R.string.chat_history_imported_file_empty))
+                        }
+
+                        // 转换为 ChatHistory 列表
+                        chatHistories.addAll(convertToOperitFormat(content, format))
+                    }
+                }
+
+                if (chatHistories.isEmpty()) {
+                    return@withContext ChatImportResult(0, 0, 0)
+                }
+
+                // 保存导入的对话
+                val existingIds = chatHistoriesFlow.first().map { it.id }.toMutableSet()
+
+                var newCount = 0
+                var updatedCount = 0
+                var skippedCount = 0
+
+                for (chatHistory in chatHistories) {
+                    if (chatHistory.messages.isEmpty()) {
+                        skippedCount++
+                        continue
+                    }
+
+                    if (existingIds.contains(chatHistory.id)) {
+                        updatedCount++
+                    } else {
+                        newCount++
+                        existingIds.add(chatHistory.id)
+                    }
+
+                    saveChatHistory(chatHistory)
+                }
+
+                AppLogger.d(TAG, "导入完成: 新增=$newCount, 更新=$updatedCount, 跳过=$skippedCount")
+                ChatImportResult(newCount, updatedCount, skippedCount)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "导入聊天记录失败", e)
+                throw e
+            }
+        }
+
+    private suspend fun importCsvChatHistoriesStream(
+        inputStream: InputStream,
+        existingIds: MutableSet<String>,
+    ): ChatImportResult {
+        val counters = ImportCounters()
+        var importedIndex = 0
+        var currentChat: CsvChatAccumulator? = null
+        var sawDataRow = false
+        val importedFolders = mutableListOf<ChatFolder>()
+
+        suspend fun flushCurrentChat() {
+            if (importedFolders.isNotEmpty()) {
+                chatFolders.importFolders(importedFolders) { it.describe(context) }
+                importedFolders.clear()
+            }
+            val chat = currentChat ?: return
+            importedIndex++
+            consumeImportedChat(
+                archivedChat = chat.toArchivedChat(),
+                existingIds = existingIds,
+                counters = counters,
+                importedIndex = importedIndex,
+            )
+            currentChat = null
+        }
+
+        InputStreamReader(inputStream, StandardCharsets.UTF_8).use { input ->
+            val rowReader = ChatHistoryCsv.RowReader(input)
+            val header = rowReader.nextRow()
+                ?: throw Exception(context.getString(R.string.chat_history_imported_file_empty))
+            val normalizedHeader = header.mapIndexed { index, value ->
+                if (index == 0) value.removePrefix("\uFEFF") else value
+            }.map { it.trim() }
+            require(ChatHistoryCsv.supportsHeader(normalizedHeader)) {
+                "Unsupported Operit CSV header"
+            }
+            val columns = normalizedHeader.withIndex().associate { it.value to it.index }
+
+            while (true) {
+                val row = rowReader.nextRow() ?: break
+                if (row.all { it.isBlank() }) {
+                    continue
+                }
+                sawDataRow = true
+                require(row.size == normalizedHeader.size) {
+                    "Invalid Operit CSV row width: expected ${normalizedHeader.size}, got ${row.size}"
+                }
+                val version = csvValue(row, columns, "format_version")
+                require(version == "1" || version == ChatHistoryCsv.FORMAT_VERSION) {
+                    "Unsupported Operit CSV format version: $version"
+                }
+                when (csvValue(row, columns, "record_type")) {
+                    "folder" -> {
+                        require(currentChat == null) { "CSV folder rows must precede chat rows" }
+                        importedFolders += operitArchiveJson.decodeFromString<ChatFolder>(
+                            csvRequired(row, columns, "folder_path"),
+                        )
+                    }
+                    ChatHistoryCsv.RECORD_CHAT -> {
+                        flushCurrentChat()
+                        currentChat = parseCsvChat(row, columns)
+                    }
+
+                    ChatHistoryCsv.RECORD_MESSAGE -> {
+                        val chat = currentChat
+                            ?: throw ConversionException("CSV message row appears before a chat row")
+                        requireCsvChatId(row, columns, chat.id)
+                        val message = parseCsvMessage(row, columns)
+                        val orderIndexValue = csvRequired(row, columns, "message_order_index")
+                        val orderIndex = orderIndexValue.toIntOrNull()
+                            ?: throw ConversionException("Invalid CSV integer in message_order_index: $orderIndexValue")
+                        require(orderIndex >= 0) { "CSV message order index must not be negative" }
+                        require(chat.messages.none { it.orderIndex == orderIndex }) {
+                            "Duplicate CSV message order index: $orderIndex"
+                        }
+                        require(chat.messages.none { it.message.timestamp == message.timestamp }) {
+                            "Duplicate CSV message timestamp: ${message.timestamp}"
+                        }
+                        chat.messages += CsvMessageRecord(orderIndex, message)
+                    }
+
+                    ChatHistoryCsv.RECORD_VARIANT -> {
+                        val chat = currentChat
+                            ?: throw ConversionException("CSV variant row appears before a chat row")
+                        requireCsvChatId(row, columns, chat.id)
+                        val messageTimestamp = csvLong(row, columns, "message_timestamp")
+                        require(chat.messages.any { it.message.timestamp == messageTimestamp }) {
+                            "CSV variant row references an unknown message: $messageTimestamp"
+                        }
+                        chat.variantsByTimestamp
+                            .getOrPut(messageTimestamp) { mutableListOf() }
+                            .add(parseCsvVariant(row, columns, messageTimestamp))
+                    }
+
+                    else -> throw ConversionException(
+                        "Unsupported Operit CSV record type: ${csvValue(row, columns, "record_type")}",
+                    )
+                }
+            }
+        }
+
+        flushCurrentChat()
+        if (!sawDataRow) {
+            throw Exception(context.getString(R.string.chat_history_imported_file_empty))
+        }
+        AppLogger.d(
+            TAG,
+            "CSV 流式导入完成: total=$importedIndex, new=${counters.newCount}, updated=${counters.updatedCount}, skipped=${counters.skippedCount}",
+        )
+        return ChatImportResult(counters.newCount, counters.updatedCount, counters.skippedCount)
+    }
+
+    private fun parseCsvChat(
+        row: List<String>,
+        columns: Map<String, Int>,
+    ): CsvChatAccumulator {
+        return CsvChatAccumulator(
+            id = csvRequired(row, columns, "chat_id"),
+            title = csvValue(row, columns, "title"),
+            createdAt = csvDate(row, columns, "created_at"),
+            updatedAt = csvDate(row, columns, "updated_at"),
+            inputTokens = csvLong(row, columns, "chat_input_tokens"),
+            outputTokens = csvLong(row, columns, "chat_output_tokens"),
+            currentWindowSize = csvLong(row, columns, "current_window_size"),
+            usageBreakdownJson = if ("usage_breakdown_json" in columns) {
+                csvNullable(row, columns, "usage_breakdown_json")
+            } else null,
+            group = csvNullable(row, columns, "group"),
+            displayOrder = csvLong(row, columns, "display_order"),
+            workspace = csvNullable(row, columns, "workspace"),
+            workspaceEnv = csvNullable(row, columns, "workspace_env"),
+            parentChatId = csvNullable(row, columns, "parent_chat_id"),
+            characterCardName = csvNullable(row, columns, "character_card_name"),
+            characterGroupId = csvNullable(row, columns, "character_group_id"),
+            locked = csvBoolean(row, columns, "locked"),
+            pinned = csvBoolean(row, columns, "pinned"),
+            archived = "archived" in columns && csvBoolean(row, columns, "archived"),
+            folderId = if ("folder_id" in columns) csvNullable(row, columns, "folder_id") else null,
+            lastUsedAt = if ("last_used_at" in columns) csvLong(row, columns, "last_used_at") else 0L,
+            folderPath = if ("folder_path" in columns) {
+                val value = csvValue(row, columns, "folder_path")
+                if (value.isBlank()) emptyList() else operitArchiveJson.decodeFromString<List<ChatFolder>>(value)
+            } else emptyList(),
+        )
+    }
+
+    private fun parseCsvMessage(
+        row: List<String>,
+        columns: Map<String, Int>,
+    ): ChatMessage {
+        val displayMode = csvValue(row, columns, "display_mode")
+            .ifBlank { ChatMessageDisplayMode.NORMAL.name }
+            .let { value ->
+                runCatching { ChatMessageDisplayMode.valueOf(value) }.getOrElse {
+                    throw ConversionException("Unsupported chat message display mode: $value")
+                }
+            }
+        val sections = if ("message_sections" in columns) {
+            MessageSectionStorage.decode(csvValue(row, columns, "message_sections"), "")
+        } else {
+            MessageSectionCodec.parse(csvValue(row, columns, "message_content"))
+        }
+        return ChatMessage(
+            sender = csvRequired(row, columns, "sender"),
+            sections = sections,
+            content = MessageSectionCodec.render(sections),
+            timestamp = csvLong(row, columns, "message_timestamp"),
+            roleName = csvValue(row, columns, "role_name"),
+            selectedVariantIndex = csvInt(row, columns, "selected_variant_index"),
+            variantCount = csvInt(row, columns, "variant_count", default = 1),
+            provider = csvValue(row, columns, "provider"),
+            modelName = csvValue(row, columns, "model_name"),
+            inputTokens = csvLong(row, columns, "input_tokens"),
+            outputTokens = csvLong(row, columns, "output_tokens"),
+            cachedInputTokens = csvLong(row, columns, "cached_input_tokens"),
+            sentAt = csvLong(row, columns, "sent_at"),
+            outputDurationMs = csvLong(row, columns, "output_duration_ms"),
+            waitDurationMs = csvLong(row, columns, "wait_duration_ms"),
+            completedAt = csvLong(row, columns, "completed_at"),
+            displayMode = displayMode,
+            isFavorite = csvBoolean(row, columns, "is_favorite"),
+        )
+    }
+
+    private fun parseCsvVariant(
+        row: List<String>,
+        columns: Map<String, Int>,
+        messageTimestamp: Long,
+    ): OperitArchivedMessageVariant {
+        return OperitArchivedMessageVariant(
+            variantIndex = csvInt(row, columns, "variant_index"),
+            sections = if ("variant_sections" in columns) {
+                MessageSectionStorage.decode(csvValue(row, columns, "variant_sections"), "")
+            } else {
+                MessageSectionCodec.parse(csvValue(row, columns, "variant_content"))
+            },
+            roleName = csvValue(row, columns, "variant_role_name"),
+            provider = csvValue(row, columns, "variant_provider"),
+            modelName = csvValue(row, columns, "variant_model_name"),
+            inputTokens = csvLong(row, columns, "variant_input_tokens"),
+            outputTokens = csvLong(row, columns, "variant_output_tokens"),
+            cachedInputTokens = csvLong(row, columns, "variant_cached_input_tokens"),
+            sentAt = csvLong(row, columns, "variant_sent_at"),
+            outputDurationMs = csvLong(row, columns, "variant_output_duration_ms"),
+            waitDurationMs = csvLong(row, columns, "variant_wait_duration_ms"),
+            completedAt = csvLong(row, columns, "variant_completed_at"),
+        )
+    }
+
+    private fun requireCsvChatId(
+        row: List<String>,
+        columns: Map<String, Int>,
+        expectedChatId: String,
+    ) {
+        require(csvRequired(row, columns, "chat_id") == expectedChatId) {
+            "CSV row belongs to a different chat"
+        }
+    }
+
+    private fun csvValue(
+        row: List<String>,
+        columns: Map<String, Int>,
+        name: String,
+    ): String = row.getOrNull(columns.getValue(name)).orEmpty()
+
+    private fun csvRequired(
+        row: List<String>,
+        columns: Map<String, Int>,
+        name: String,
+    ): String = csvValue(row, columns, name).takeIf { it.isNotBlank() }
+        ?: throw ConversionException("CSV field is required: $name")
+
+    private fun csvNullable(
+        row: List<String>,
+        columns: Map<String, Int>,
+        name: String,
+    ): String? = csvValue(row, columns, name).takeIf { it.isNotEmpty() }
+
+    private fun csvLong(
+        row: List<String>,
+        columns: Map<String, Int>,
+        name: String,
+        default: Long = 0L,
+    ): Long {
+        val value = csvValue(row, columns, name)
+        return if (value.isBlank()) {
+            default
+        } else {
+            value.toLongOrNull() ?: throw ConversionException("Invalid CSV number in $name: $value")
+        }
+    }
+
+    private fun csvInt(
+        row: List<String>,
+        columns: Map<String, Int>,
+        name: String,
+        default: Int = 0,
+    ): Int {
+        val value = csvValue(row, columns, name)
+        return if (value.isBlank()) {
+            default
+        } else {
+            value.toIntOrNull() ?: throw ConversionException("Invalid CSV integer in $name: $value")
+        }
+    }
+
+    private fun csvBoolean(
+        row: List<String>,
+        columns: Map<String, Int>,
+        name: String,
+    ): Boolean {
+        return when (val value = csvValue(row, columns, name).lowercase(Locale.ROOT)) {
+            "", "false" -> false
+            "true" -> true
+            else -> throw ConversionException("Invalid CSV boolean in $name: $value")
+        }
+    }
+
+    private fun csvDate(
+        row: List<String>,
+        columns: Map<String, Int>,
+        name: String,
+    ): LocalDateTime = try {
+        LocalDateTime.parse(csvRequired(row, columns, name), JSON_DATE_FORMATTER)
+    } catch (e: Exception) {
+        throw ConversionException("Invalid CSV date in $name", e)
+    }
+
+    private fun parseLegacyOperitChatHistories(content: String): List<ChatHistory> {
+        try {
+            return operitArchiveJson.decodeFromString<List<ChatHistory>>(content)
+        } catch (e: Exception) {
+            val gson =
+                GsonBuilder()
+                    .setDateFormat("yyyy-MM-dd'T'HH:mm:ss")
+                    .create()
+            val type = object : TypeToken<List<ChatHistory>>() {}.type
+            return gson.fromJson<List<ChatHistory>>(content, type)
+        }
+    }
+
+    private fun convertToOperitFormat(content: String, format: ChatFormat): List<ChatHistory> {
+        return try {
+            when (format) {
+                ChatFormat.OPERIT -> {
+                    parseLegacyOperitChatHistories(content)
+                }
+
+                ChatFormat.MARKDOWN -> {
+                    AppLogger.d(TAG, "使用 Markdown 转换器")
+                    MarkdownConverter(context).convert(content)
+                }
+
+                ChatFormat.GENERIC_JSON -> {
+                    AppLogger.d(TAG, "使用通用 JSON 转换器")
+                    GenericJsonConverter().convert(content)
+                }
+                
+                ChatFormat.CLAUDE -> {
+                    // Claude 格式暂不支持，回退到通用 JSON
+                    AppLogger.d(TAG, "Claude 格式回退到通用 JSON 转换器")
+                    GenericJsonConverter().convert(content)
+                }
+                
+                else -> {
+                    throw ConversionException(context.getString(R.string.chat_history_unsupported_format, format))
+                }
+            }
+        } catch (e: ConversionException) {
+            throw Exception(context.getString(R.string.chat_history_convert_format_failed, e.message ?: ""), e)
+        } catch (e: Exception) {
+            throw Exception(context.getString(R.string.chat_history_parse_backup_failed, e.message ?: ""), e)
+        }
+    }
+
+    /**
+     * 清理绑定已删除角色卡的对话（将characterCardName设为null）
+     * @param characterCardName 已删除的角色卡名称
+     */
+    suspend fun clearCharacterCardBinding(characterCardName: String) {
+        try {
+            withContext(Dispatchers.IO) {
+                database.withTransaction {
+                    chatDao.clearCharacterCardBinding(characterCardName)
+                    chatFolders.rebindFolders(ChatFolderBinding(characterCardName, null), ChatFolderBinding(null, null))
+                }
+                AppLogger.d(TAG, "已清理绑定角色卡 '$characterCardName' 的对话")
+            }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "清理角色卡绑定失败: $characterCardName", e)
+        }
+    }
+
+    /**
+     * 将指定角色卡或未绑定的对话转移到新的角色卡
+     * @return 受影响的对话数量
+     */
+    suspend fun reassignChatsToCharacterCard(
+            sourceCharacterCardName: String?,
+            targetCharacterCardName: String
+    ): Int {
+        return withContext(Dispatchers.IO) {
+            try {
+                val updated = database.withTransaction {
+                    val count = if (sourceCharacterCardName == null) {
+                        chatDao.assignCharacterCardToUnbound(targetCharacterCardName)
+                    } else {
+                        chatDao.renameCharacterCardBinding(sourceCharacterCardName, targetCharacterCardName)
+                    }
+                    chatFolders.rebindFolders(ChatFolderBinding(sourceCharacterCardName, null), ChatFolderBinding(targetCharacterCardName, null))
+                    count
+                }
+                AppLogger.d(
+                        TAG,
+                        "角色卡聊天重分配: ${sourceCharacterCardName ?: "未绑定"} -> $targetCharacterCardName, 更新 $updated 条记录"
+                )
+                updated
+            } catch (e: Exception) {
+                AppLogger.e(
+                        TAG,
+                        "重命名角色卡绑定失败: ${sourceCharacterCardName ?: "未绑定"} -> $targetCharacterCardName",
+                        e
+                )
+                throw e
+            }
+        }
+    }
+
+    suspend fun getLatestSummaryTimestamp(chatId: String): Long? {
+        return withContext(Dispatchers.IO) {
+            try {
+                messageDao.getLatestSummaryTimestamp(chatId)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "获取最新 summary 时间戳失败", e)
+                null
+            }
+        }
+    }
+
+    suspend fun loadMessagesAfterLatestSummaryInRange(
+        chatId: String,
+        beforeTimestampExclusive: Long? = null,
+        upToTimestampInclusive: Long? = null,
+    ): List<ChatMessage> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val latestSummaryTimestamp =
+                    when {
+                        beforeTimestampExclusive != null ->
+                            messageDao.getLatestSummaryTimestampBefore(
+                                chatId,
+                                beforeTimestampExclusive,
+                            )
+                        upToTimestampInclusive != null ->
+                            messageDao.getLatestSummaryTimestampUpTo(
+                                chatId,
+                                upToTimestampInclusive,
+                            )
+                        else -> messageDao.getLatestSummaryTimestamp(chatId)
+                    }
+                val messageEntities =
+                    chatContentDao.getMessagesForChatInRangeAsc(
+                        chatId = chatId,
+                        afterTimestampExclusive = latestSummaryTimestamp,
+                        beforeTimestampExclusive = beforeTimestampExclusive,
+                        upToTimestampInclusive = upToTimestampInclusive,
+                    )
+                hydrateMessages(chatId, messageEntities)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "按总结窗口加载聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun hasUserMessage(chatId: String): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                messageDao.existsUserMessage(chatId)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "检查聊天是否存在用户消息失败", e)
+                false
+            }
+        }
+    }
+
+    suspend fun loadRuntimeChatMessages(chatId: String): List<ChatMessage> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val latestSummaryTimestamp = messageDao.getLatestSummaryTimestamp(chatId)
+                chatContentDao.getRuntimeMessagesForChatWindow(
+                    chatId = chatId,
+                    startTimestampInclusive = latestSummaryTimestamp,
+                    endTimestampInclusive = null,
+                ).toChatMessages()
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "加载运行态聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun loadRuntimeChatMessagesUpTo(
+        chatId: String,
+        upToTimestampInclusive: Long
+    ): List<ChatMessage> {
+        return withContext(Dispatchers.IO) {
+            val latestSummaryTimestamp =
+                messageDao.getLatestSummaryTimestampUpTo(chatId, upToTimestampInclusive)
+            chatContentDao.getRuntimeMessagesForChatWindow(
+                chatId = chatId,
+                startTimestampInclusive = latestSummaryTimestamp,
+                endTimestampInclusive = upToTimestampInclusive,
+            ).toChatMessages()
+        }
+    }
+
+    suspend fun loadChatMessageLocatorPreviews(
+        chatId: String,
+        query: String = "",
+    ): List<ChatMessageLocatorPreview> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val normalizedQuery = query.trim()
+                if (normalizedQuery.isBlank()) {
+                    messageDao.getLocatorPreviewsForChat(chatId, LOCATOR_PREVIEW_CHAR_COUNT)
+                } else {
+                    messageDao.searchLocatorPreviewsForChat(
+                        chatId = chatId,
+                        query = normalizedQuery,
+                        previewCharCount = LOCATOR_PREVIEW_CHAR_COUNT,
+                    )
+                }
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "加载聊天定位轻量预览失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun loadChatMessagesFromTimestamp(
+        chatId: String,
+        startTimestampInclusive: Long,
+    ): List<ChatMessage> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val messageEntities =
+                    chatContentDao.getMessagesForChatFromTimestampAsc(chatId, startTimestampInclusive)
+                hydrateMessages(chatId, messageEntities)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "按起始时间加载聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun loadChatMessagesWindow(
+        chatId: String,
+        startTimestampInclusive: Long,
+        endTimestampInclusive: Long,
+    ): List<ChatMessage> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val messageEntities =
+                    chatContentDao.getMessagesForChatWindowAsc(
+                        chatId = chatId,
+                        startTimestampInclusive = startTimestampInclusive,
+                        endTimestampInclusive = endTimestampInclusive,
+                    )
+                hydrateMessages(chatId, messageEntities)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "按时间窗口加载聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun loadChatMessagesAscAfter(
+        chatId: String,
+        afterTimestampExclusive: Long,
+        limit: Int,
+    ): List<ChatMessage> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val messageEntities =
+                    chatContentDao.getMessagesForChatAfterTimestampExclusiveAsc(
+                        chatId,
+                        afterTimestampExclusive,
+                        limit,
+                    )
+                hydrateMessages(chatId, messageEntities)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "按起始时间后分页加载聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun loadOlderChatMessages(
+        chatId: String,
+        beforeTimestampExclusive: Long,
+        limit: Int,
+    ): List<ChatMessage> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val messageEntities =
+                    chatContentDao
+                        .getMessagesForChatBeforeTimestampExclusiveDesc(
+                            chatId,
+                            beforeTimestampExclusive,
+                            limit,
+                        ).asReversed()
+                hydrateMessages(chatId, messageEntities)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "加载更早聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun hasMessagesBefore(
+        chatId: String,
+        beforeTimestampExclusive: Long,
+    ): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                messageDao.existsMessagesBeforeTimestamp(chatId, beforeTimestampExclusive)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "检查是否存在更早聊天消息失败", e)
+                false
+            }
+        }
+    }
+
+    suspend fun hasMessagesAfter(
+        chatId: String,
+        afterTimestampExclusive: Long,
+    ): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                messageDao.existsMessagesAfterTimestamp(chatId, afterTimestampExclusive)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "检查是否存在更新聊天消息失败", e)
+                false
+            }
+        }
+    }
+
+    suspend fun loadChatMessagePageMetadataDesc(
+        chatId: String,
+        limit: Int,
+        beforeTimestampExclusive: Long?,
+        upToTimestampInclusive: Long?,
+    ): List<ChatMessagePageMetadata> = withContext(Dispatchers.IO) {
+        messageDao.getPageMetadataForChatDesc(
+            chatId, limit, beforeTimestampExclusive, upToTimestampInclusive,
+        )
+    }
+
+    suspend fun loadChatMessagesDesc(
+        chatId: String,
+        limit: Int,
+        beforeTimestampExclusive: Long? = null,
+    ): List<ChatMessage> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val messageEntities =
+                    if (beforeTimestampExclusive != null) {
+                        chatContentDao.getMessagesForChatBeforeTimestampExclusiveDesc(
+                            chatId,
+                            beforeTimestampExclusive,
+                            limit,
+                        )
+                    } else {
+                        chatContentDao.getMessagesForChatDesc(chatId, limit)
+                    }
+                hydrateMessages(chatId, messageEntities)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "按倒序分页加载聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun loadChatMessagesDescUpTo(
+        chatId: String,
+        maxTimestampInclusive: Long,
+        limit: Int,
+    ): List<ChatMessage> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val messageEntities =
+                    chatContentDao.getMessagesForChatBeforeTimestampDesc(
+                        chatId,
+                        maxTimestampInclusive,
+                        limit,
+                    )
+                hydrateMessages(chatId, messageEntities)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "按截止时间倒序分页加载聊天消息失败", e)
+                emptyList()
+            }
+        }
+    }
+
+    /**
+     * 将指定角色群组下的对话转移到新的角色群组
+     * @return 受影响的对话数量
+     */
+    suspend fun reassignChatsToCharacterGroup(
+        sourceCharacterGroupId: String?,
+        targetCharacterGroupId: String
+    ): Int {
+        return withContext(Dispatchers.IO) {
+            try {
+                val updated = database.withTransaction {
+                    val count = if (sourceCharacterGroupId == null) {
+                        chatDao.assignCharacterGroupToUnbound(targetCharacterGroupId)
+                    } else {
+                        chatDao.renameCharacterGroupBinding(sourceCharacterGroupId, targetCharacterGroupId)
+                    }
+                    chatFolders.rebindFolders(ChatFolderBinding(null, sourceCharacterGroupId), ChatFolderBinding(null, targetCharacterGroupId))
+                    count
+                }
+                AppLogger.d(
+                    TAG,
+                    "角色群组聊天重分配: ${sourceCharacterGroupId ?: "未绑定"} -> $targetCharacterGroupId, 更新 $updated 条记录"
+                )
+                updated
+            } catch (e: Exception) {
+                AppLogger.e(
+                    TAG,
+                    "重命名角色群组绑定失败: ${sourceCharacterGroupId ?: "未绑定"} -> $targetCharacterGroupId",
+                    e
+                )
+                throw e
+            }
+        }
+    }
+
+    // 更新聊天绑定的群组角色卡
+    suspend fun updateChatCharacterGroupId(chatId: String, characterGroupId: String?) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                chatDao.updateChatCharacterGroupId(chatId, characterGroupId)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to update chat character group for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    // 同时更新聊天绑定的角色卡与群组
+    suspend fun updateChatCharacterBinding(
+        chatId: String,
+        characterCardName: String?,
+        characterGroupId: String?
+    ) {
+        requireNormalConversation(chatId)
+        chatMutex(chatId).withLock {
+            try {
+                chatDao.updateChatCharacterBinding(chatId, characterCardName, characterGroupId)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to update chat character binding for chat $chatId", e)
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 清理绑定已删除角色群组的对话（将characterGroupId设为null）
+     * @return 受影响的对话数量
+     */
+    suspend fun clearCharacterGroupBinding(characterGroupId: String): Int {
+        return withContext(Dispatchers.IO) {
+            try {
+                val updated = database.withTransaction {
+                    val count = chatDao.clearCharacterGroupBinding(characterGroupId)
+                    chatFolders.rebindFolders(ChatFolderBinding(null, characterGroupId), ChatFolderBinding(null, null))
+                    count
+                }
+                AppLogger.d(TAG, "已清理绑定角色群组 '$characterGroupId' 的对话: $updated")
+                updated
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "清理角色群组绑定失败: $characterGroupId", e)
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 批量删除绑定到缺失角色卡（或未绑定）的未锁定对话
+     * @return 实际删除的对话数量
+     */
+    suspend fun deleteChatsByCharacterCardBinding(sourceCharacterCardName: String?): Int = withContext(Dispatchers.IO) {
+        val targets = chatDao.getAllChatsDirectly().filter { chat ->
+            chat.chatKind == ChatKind.NORMAL && !chat.locked &&
+                (if (sourceCharacterCardName == null) chat.characterCardName == null && chat.characterGroupId == null
+                else chat.characterCardName == sourceCharacterCardName)
+        }
+        var deleted = 0
+        for (target in targets) {
+            if (deleteOrdinaryChat(target.id, allowCurrentChat = true)) {
+                deleted++
+                if (currentChatIdFlow.first() == target.id) clearCurrentChatId()
+            }
+        }
+        clearDeletedChatDrafts()
+        AppLogger.d(TAG, "删除角色卡残留对话：$deleted 条，关联子会话已停止并清理")
+        deleted
+    }
+    /**
+     * 批量为特定聊天更新角色卡绑定
+     * @return 受影响的对话数量
+     */
+    suspend fun assignCharacterCardToChats(
+        chatIds: List<String>,
+        targetCharacterCardName: String?
+    ): Int {
+        chatIds.forEach { requireNormalConversation(it) }
+        if (chatIds.isEmpty()) {
+            return 0
+        }
+        return withContext(Dispatchers.IO) {
+            try {
+                chatDao.updateCharacterCardForChats(chatIds, targetCharacterCardName)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "批量更新聊天角色卡失败: $targetCharacterCardName, chatIds=$chatIds", e)
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 批量为特定聊天更新角色群组绑定
+     * @return 受影响的对话数量
+     */
+    suspend fun assignCharacterGroupToChats(
+        chatIds: List<String>,
+        targetCharacterGroupId: String?
+    ): Int {
+        chatIds.forEach { requireNormalConversation(it) }
+        if (chatIds.isEmpty()) {
+            return 0
+        }
+        return withContext(Dispatchers.IO) {
+            try {
+                chatDao.updateCharacterGroupForChats(chatIds, targetCharacterGroupId)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "批量更新聊天角色群组失败: $targetCharacterGroupId, chatIds=$chatIds", e)
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 批量为特定聊天移除角色群组绑定
+     * @return 受影响的对话数量
+     */
+    suspend fun clearCharacterGroupBindingForChats(
+        chatIds: List<String>
+    ): Int {
+        chatIds.forEach { requireNormalConversation(it) }
+        if (chatIds.isEmpty()) {
+            return 0
+        }
+        return withContext(Dispatchers.IO) {
+            try {
+                chatDao.clearCharacterGroupForChats(chatIds)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "批量清理聊天角色群组失败: chatIds=$chatIds", e)
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 批量为特定聊天更新分组
+     * @return 受影响的对话数量
+     */
+    suspend fun assignGroupToChats(
+        chatIds: List<String>,
+        groupName: String?
+    ): Int {
+        chatIds.forEach { requireNormalConversation(it) }
+        if (chatIds.isEmpty()) {
+            return 0
+        }
+        return withContext(Dispatchers.IO) {
+            try {
+                val folderId = groupName?.let { chatFolders.ensureLegacyRoot(it, ChatFolderBinding(null, null)).id }
+                chatFolders.assignChats(chatIds, folderId)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "批量更新聊天分组失败: $groupName, chatIds=$chatIds", e)
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 批量重命名对话中绑定的角色卡名称
+     * @return 受影响的对话数量
+     */
+    suspend fun renameCharacterCardInChats(oldName: String, newName: String): Int {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.withTransaction {
+                    val count = chatDao.renameCharacterCardBinding(oldName, newName)
+                    chatFolders.rebindFolders(ChatFolderBinding(oldName, null), ChatFolderBinding(newName, null))
+                    count
+                }
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "批量重命名对话绑定角色卡失败: $oldName -> $newName", e)
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 批量重命名消息中的角色名称
+     * @return 受影响的消息数量
+     */
+    suspend fun renameRoleNameInMessages(oldName: String, newName: String): Int {
+        return withContext(Dispatchers.IO) {
+            try {
+                messageDao.renameRoleName(oldName, newName)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "批量重命名消息中的角色名失败: $oldName -> $newName", e)
+                throw e
+            }
+        }
+    }
+}
+
+data class ChatImportResult(
+    val new: Int,
+    val updated: Int,
+    val skipped: Int
+) {
+    val total: Int
+        get() = new + updated
+}

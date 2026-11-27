@@ -1,0 +1,1129 @@
+package com.ai.assistance.operit.data.backup
+
+import android.content.Context
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.util.AtomicFile
+import com.ai.assistance.operit.data.db.AppDatabase
+import com.ai.assistance.operit.data.db.ObjectBoxManager
+import com.ai.assistance.operit.data.recovery.MainProcessController
+import com.ai.assistance.operit.data.stats.TokenUsageRepository
+import com.ai.assistance.operit.util.logging.AppLogger
+import com.ai.assistance.operit.util.files.OperitPaths
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
+import kotlin.system.measureTimeMillis
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+
+private const val SNAPSHOT_PACKAGE_NAME_PREFIX = "com.ai.assistance.operit"
+
+internal fun isSupportedSnapshotPackageName(packageName: String): Boolean =
+    packageName.startsWith(SNAPSHOT_PACKAGE_NAME_PREFIX)
+
+object RawSnapshotBackupManager {
+
+    private const val TAG = "RawSnapshotBackup"
+    private const val FORMAT_VERSION = 1
+    private const val ZIP_PREFIX = "operit_raw_snapshot_"
+
+    private const val ENTRY_MANIFEST = "manifest.json"
+    private const val ENTRY_PAYLOAD_PREFIX = "payload/"
+
+    private const val ENTRY_FILES = "payload/files/"
+    private const val ENTRY_EXTERNAL_FILES = "payload/external_files/"
+    private const val ENTRY_SHARED_PREFS = "payload/shared_prefs/"
+    private const val ENTRY_DATASTORE = "payload/datastore/"
+    private const val ENTRY_DATABASES = "payload/databases/"
+
+    private val terminalTopLevelDirNames = setOf("usr", "tmp", "bin")
+    private val logFilesTopLevelDirNames = setOf("logs")
+    private val logExternalTopLevelDirNames = setOf("anr_reports")
+
+    private const val RESTORE_ROOT_APP_DATA = "app_data"
+    private const val RESTORE_ROOT_EXTERNAL_FILES = "external_files"
+
+    // FileUtils.copyFileToInternalStorage() 生成的主题资源都以固定前缀、UUID 和扩展名结尾。
+    // 只有完整匹配该格式的根目录文件才允许进入“未引用主题资源”筛选。
+    private val themeMediaFlatNamePattern = Regex(
+        """^(?:background(?:_video)?|bubble_(?:ai|user)(?:_font)?|custom_font|user_avatar|ai_avatar|global_user_avatar|avatar_.+|group_avatar_.+)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[A-Za-z0-9]+$""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    internal fun isThemeMediaFlatFileName(name: String): Boolean =
+        themeMediaFlatNamePattern.matches(name)
+
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    @Serializable
+    data class ResourceMapping(
+        val ownerType: String,
+        val kind: String,
+        val ownerId: String? = null,
+        val ownerName: String? = null,
+        val originalUri: String,
+        val snapshotPath: String,
+        val restoreRoot: String? = null,
+        val restoreRelativePath: String? = null,
+    )
+
+    @Serializable
+    data class Manifest(
+        val formatVersion: Int,
+        val packageName: String,
+        val createdAt: Long,
+        val includes: List<String>,
+        val includeTerminalData: Boolean = true,
+        val includeLogs: Boolean = true,
+        val resources: List<ResourceMapping> = emptyList(),
+    )
+
+    data class PreparedImageResource(
+        val source: File,
+        val mapping: ResourceMapping,
+    )
+
+    private data class ResourceRestorePlanResult(
+        val plans: List<RawSnapshotResourceRestorePlan>,
+        val skippedCount: Int,
+    )
+
+    private data class ResourceRestoreCopyResult(
+        val restoredCount: Int,
+        val skippedCount: Int,
+    )
+
+    data class RestoreResult(
+        val restoredResourceCount: Int,
+        val skippedResourceCount: Int,
+    )
+
+    private data class RestoreLocation(
+        val root: String,
+        val relativePath: String,
+    )
+
+    data class SnapshotOptions(
+        val includeTerminalData: Boolean = false,
+        val includeLogs: Boolean = true,
+    )
+
+    enum class ExportProgress {
+        PREPARING,
+        SCANNING_FILES,
+        ZIPPING_FILES,
+        ZIPPING_EXTERNAL_FILES,
+        ZIPPING_SHARED_PREFS,
+        ZIPPING_DATASTORE,
+        ZIPPING_DATABASES,
+        FINALIZING
+    }
+
+    data class ExportProgressInfo(
+        val stage: ExportProgress,
+        val percent: Int? = null,
+        val scannedFiles: Int? = null
+    )
+
+    enum class RestoreProgress {
+        PREPARING,
+        READING_ZIP,
+        EXTRACTING,
+        REPLACING_FILES,
+        REPLACING_EXTERNAL_FILES,
+        REPLACING_SHARED_PREFS,
+        REPLACING_DATASTORE,
+        REPLACING_DATABASES,
+        FINALIZING
+    }
+
+    private val json = Json {
+        prettyPrint = true
+        encodeDefaults = true
+        ignoreUnknownKeys = true
+        isLenient = true
+    }
+
+    suspend fun exportToBackupDir(
+        context: Context,
+        options: SnapshotOptions = SnapshotOptions(),
+        onProgress: ((ExportProgressInfo) -> Unit)? = null
+    ): File = withContext(Dispatchers.IO) {
+        TokenUsageRepository.withDatabaseAccess {
+            AppLogger.i(TAG, "export start (includeTerminalData=${options.includeTerminalData})")
+            withContext(Dispatchers.Main) { onProgress?.invoke(ExportProgressInfo(ExportProgress.PREPARING)) }
+            val exportDir = OperitBackupDirs.rawSnapshotDir()
+            val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"))
+            val outFile = File(exportDir, "$ZIP_PREFIX$timestamp.zip")
+            val tmpFile = File(exportDir, "${outFile.name}.tmp")
+
+            if (tmpFile.exists()) {
+                tmpFile.delete()
+            }
+
+            val dataDir = context.dataDir
+            val externalFilesDir = requireNotNull(context.getExternalFilesDir(null)) {
+                "External files dir is unavailable"
+            }
+            val sharedPrefsDir = File(dataDir, "shared_prefs")
+            val datastoreDir = File(dataDir, "datastore")
+            val databasesDir = File(dataDir, "databases")
+            var resourceReferencesLoaded = true
+            val resourceReferences = try {
+                DefaultRawSnapshotResourceReferenceProvider(context).collectReferences()
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Exception) {
+                // 原始快照首先用于数据救援，偏好解析失败不能阻断原始文件归档。
+                // 但此时不能把“未知”误判为空集合，否则会裁掉仍在使用的主题媒体。
+                resourceReferencesLoaded = false
+                AppLogger.w(TAG, "collect resource references failed; exporting raw data without resource mapping", error)
+                emptySet()
+            }
+            val preparedResources = prepareImageResources(
+                context = context,
+                references = resourceReferences,
+            )
+            val referencedImagePaths = preparedResources
+                .mapNotNull { it.source.canonicalFile.path }
+                .toSet()
+
+            try {
+                val sqliteDb = AppDatabase.getDatabase(context).openHelper.writableDatabase
+                sqliteDb.query("PRAGMA wal_checkpoint(FULL)").close()
+            } catch (e: Exception) {
+                AppLogger.w(TAG, "wal_checkpoint failed", e)
+            }
+
+            val includes = listOf(
+                ENTRY_FILES,
+                ENTRY_EXTERNAL_FILES,
+                ENTRY_SHARED_PREFS,
+                ENTRY_DATASTORE,
+                ENTRY_DATABASES,
+                RawSnapshotResourceLayout.ROOT,
+            )
+            val manifest = Manifest(
+                formatVersion = FORMAT_VERSION,
+                packageName = context.packageName,
+                createdAt = System.currentTimeMillis(),
+                includes = includes,
+                includeTerminalData = options.includeTerminalData,
+                includeLogs = options.includeLogs,
+                resources = preparedResources.map { it.mapping },
+            )
+
+            ZipOutputStream(BufferedOutputStream(FileOutputStream(tmpFile))).use { zos ->
+                zos.putNextEntry(ZipEntry(ENTRY_MANIFEST))
+                zos.write(json.encodeToString(manifest).toByteArray(Charsets.UTF_8))
+                zos.closeEntry()
+
+                if (preparedResources.isNotEmpty()) {
+                    val writtenResources = HashSet<String>()
+                    val resourcesMs = measureTimeMillis {
+                        preparedResources.forEach { prepared ->
+                            val source = prepared.source
+                            if (!source.isFile) return@forEach
+                            val snapshotPath = prepared.mapping.snapshotPath
+                            if (!writtenResources.add(snapshotPath)) return@forEach
+                            zos.putNextEntry(ZipEntry(snapshotPath))
+                            BufferedInputStream(FileInputStream(source)).use { input ->
+                                val buffer = ByteArray(64 * 1024)
+                                while (true) {
+                                    val read = input.read(buffer)
+                                    if (read <= 0) break
+                                    zos.write(buffer, 0, read)
+                                }
+                            }
+                            zos.closeEntry()
+                        }
+                    }
+                    AppLogger.i(TAG, "export add resources done in ${resourcesMs}ms (count=${writtenResources.size})")
+                }
+
+                val alwaysExcluded = OperitPaths.rawSnapshotExcludedFilesTopLevelDirNames()
+                val excludedNames = buildSet {
+                    addAll(alwaysExcluded)
+                    if (!options.includeTerminalData) addAll(terminalTopLevelDirNames)
+                    if (!options.includeLogs) addAll(logFilesTopLevelDirNames)
+                }
+                withContext(Dispatchers.Main) {
+                    onProgress?.invoke(ExportProgressInfo(stage = ExportProgress.SCANNING_FILES, scannedFiles = 0))
+                }
+                val filesTotalCount = totalFilesForZip(
+                    dir = context.filesDir,
+                    entryPrefix = ENTRY_FILES,
+                    excludedTopLevelDirNames = excludedNames,
+                    referencedResourcePaths = referencedImagePaths,
+                    pruneUnreferencedThemeMedia = resourceReferencesLoaded,
+                    onScannedCountChanged = { scanned ->
+                        if (onProgress != null) {
+                            mainHandler.post {
+                                onProgress.invoke(
+                                    ExportProgressInfo(stage = ExportProgress.SCANNING_FILES, scannedFiles = scanned)
+                                )
+                            }
+                        }
+                    }
+                )
+                withContext(Dispatchers.Main) {
+                    onProgress?.invoke(
+                        ExportProgressInfo(stage = ExportProgress.SCANNING_FILES, scannedFiles = filesTotalCount)
+                    )
+                }
+                withContext(Dispatchers.Main) { onProgress?.invoke(ExportProgressInfo(ExportProgress.ZIPPING_FILES, 0)) }
+                val filesMs = measureTimeMillis {
+                    addDirToZip(
+                        zos = zos,
+                        dir = context.filesDir,
+                        entryPrefix = ENTRY_FILES,
+                        excludedTopLevelDirNames = excludedNames,
+                        referencedResourcePaths = referencedImagePaths,
+                        pruneUnreferencedThemeMedia = resourceReferencesLoaded,
+                        totalFiles = filesTotalCount,
+                        onPercentChanged = { percent ->
+                            if (onProgress != null) {
+                                mainHandler.post {
+                                    onProgress.invoke(ExportProgressInfo(ExportProgress.ZIPPING_FILES, percent))
+                                }
+                            }
+                        }
+                    )
+                }
+                withContext(Dispatchers.Main) { onProgress?.invoke(ExportProgressInfo(ExportProgress.ZIPPING_FILES, 100)) }
+                AppLogger.i(TAG, "export add files done in ${filesMs}ms (excludedTopLevel=${excludedNames.size})")
+
+                val externalFilesTotalCount = totalFilesForZip(
+                    dir = externalFilesDir,
+                    entryPrefix = ENTRY_EXTERNAL_FILES,
+                    excludedTopLevelDirNames = if (options.includeLogs) emptySet() else logExternalTopLevelDirNames,
+                    referencedResourcePaths = referencedImagePaths
+                )
+                withContext(Dispatchers.Main) {
+                    onProgress?.invoke(ExportProgressInfo(ExportProgress.ZIPPING_EXTERNAL_FILES, 0))
+                }
+                val externalFilesMs = measureTimeMillis {
+                    addDirToZip(
+                        zos = zos,
+                        dir = externalFilesDir,
+                        entryPrefix = ENTRY_EXTERNAL_FILES,
+                        excludedTopLevelDirNames = if (options.includeLogs) emptySet() else logExternalTopLevelDirNames,
+                        referencedResourcePaths = referencedImagePaths,
+                        totalFiles = externalFilesTotalCount,
+                        onPercentChanged = { percent ->
+                            if (onProgress != null) {
+                                mainHandler.post {
+                                    onProgress.invoke(
+                                        ExportProgressInfo(ExportProgress.ZIPPING_EXTERNAL_FILES, percent)
+                                    )
+                                }
+                            }
+                        }
+                    )
+                }
+                withContext(Dispatchers.Main) {
+                    onProgress?.invoke(ExportProgressInfo(ExportProgress.ZIPPING_EXTERNAL_FILES, 100))
+                }
+                AppLogger.i(TAG, "export add external_files done in ${externalFilesMs}ms")
+
+                withContext(Dispatchers.Main) { onProgress?.invoke(ExportProgressInfo(ExportProgress.ZIPPING_SHARED_PREFS)) }
+                val sharedPrefsMs = measureTimeMillis { addDirToZip(zos, sharedPrefsDir, ENTRY_SHARED_PREFS) }
+                AppLogger.i(TAG, "export add shared_prefs done in ${sharedPrefsMs}ms")
+
+                withContext(Dispatchers.Main) { onProgress?.invoke(ExportProgressInfo(ExportProgress.ZIPPING_DATASTORE)) }
+                val datastoreMs = measureTimeMillis { addDirToZip(zos, datastoreDir, ENTRY_DATASTORE) }
+                AppLogger.i(TAG, "export add datastore done in ${datastoreMs}ms")
+
+                withContext(Dispatchers.Main) { onProgress?.invoke(ExportProgressInfo(ExportProgress.ZIPPING_DATABASES)) }
+                val databasesMs = measureTimeMillis { addDirToZip(zos, databasesDir, ENTRY_DATABASES) }
+                AppLogger.i(TAG, "export add databases done in ${databasesMs}ms")
+            }
+
+            withContext(Dispatchers.Main) { onProgress?.invoke(ExportProgressInfo(ExportProgress.FINALIZING)) }
+            if (outFile.exists()) {
+                outFile.delete()
+            }
+
+            if (!tmpFile.renameTo(outFile)) {
+                tmpFile.copyTo(outFile, overwrite = true)
+                tmpFile.delete()
+            }
+
+            AppLogger.i(TAG, "export done: ${outFile.absolutePath} (${outFile.length()} bytes)")
+            outFile
+        }
+    }
+
+    suspend fun restoreFromBackupUri(
+        context: Context,
+        uri: Uri,
+        ensureMainProcessStopped: Boolean = false,
+        onProgress: ((RestoreProgress) -> Unit)? = null
+    ) = withContext(Dispatchers.IO) {
+        TokenUsageRepository.withDatabaseRestore {
+            val cacheZip = File.createTempFile("raw_snapshot_restore_", ".zip", context.cacheDir)
+            val workDir = File(context.cacheDir, "raw_snapshot_restore_work").apply {
+                if (exists()) deleteRecursively()
+                mkdirs()
+            }
+            var restoreResult = RestoreResult(
+                restoredResourceCount = 0,
+                skippedResourceCount = 0,
+            )
+
+            try {
+                AppLogger.i(TAG, "restore start uri=$uri")
+                withContext(Dispatchers.Main) { onProgress?.invoke(RestoreProgress.PREPARING) }
+                withContext(Dispatchers.Main) { onProgress?.invoke(RestoreProgress.READING_ZIP) }
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(cacheZip).use { output ->
+                        input.copyTo(output)
+                    }
+                } ?: throw IllegalStateException("Failed to open uri")
+
+                AppLogger.i(TAG, "restore cached zip: ${cacheZip.absolutePath} (${cacheZip.length()} bytes)")
+
+                if (ensureMainProcessStopped && !MainProcessController.stopAndWait(context)) {
+                    throw IllegalStateException("Main application process did not stop")
+                }
+                AppDatabase.closeDatabase()
+                ObjectBoxManager.closeAll()
+
+                AppLogger.i(TAG, "restore closed databases (room + objectbox)")
+
+                withContext(Dispatchers.Main) { onProgress?.invoke(RestoreProgress.EXTRACTING) }
+                val manifest = extractZipToWorkDir(cacheZip, workDir)
+
+                val payloadDir = File(workDir, "payload")
+                val externalFilesPayloadDir = File(payloadDir, "external_files")
+
+                val resourcePlanResult = buildResourceRestorePlans(
+                    context = context,
+                    manifest = manifest,
+                    workDir = workDir,
+                )
+                val resourceRestorePlans = resourcePlanResult.plans
+                rewriteResourceUrisInExtractedPreferences(
+                    workDir = workDir,
+                    resourceRestorePlans = resourceRestorePlans,
+                )
+
+                val alwaysExcluded = OperitPaths.rawSnapshotExcludedFilesTopLevelDirNames()
+                val preserveTerminal = !manifest.includeTerminalData
+                val preservedTerminalNames = if (preserveTerminal) terminalTopLevelDirNames else emptySet()
+                val preservedAlwaysExcludedNames = alwaysExcluded.filterNot { dirName ->
+                    File(payloadDir, "files/$dirName").exists()
+                }.toSet()
+                val preservedLogNames = if (!manifest.includeLogs) logFilesTopLevelDirNames else emptySet()
+                val preservedNames = preservedTerminalNames + preservedAlwaysExcludedNames + preservedLogNames
+
+                AppLogger.i(
+                    TAG,
+                    "restore manifest ok (formatVersion=${manifest.formatVersion}, " +
+                        "includeTerminalData=${manifest.includeTerminalData}, " +
+                        "includeLogs=${manifest.includeLogs}, resources=${manifest.resources.size})"
+                )
+
+                AppLogger.i(TAG, "restore replace dirs (preserveTopLevel=${preservedNames.joinToString()})")
+
+                withContext(Dispatchers.Main) { onProgress?.invoke(RestoreProgress.REPLACING_FILES) }
+                replaceDirContents(File(payloadDir, "files"), context.filesDir, preservedTopLevelDirNames = preservedNames)
+                if (externalFilesPayloadDir.exists()) {
+                    val externalFilesDir = requireNotNull(context.getExternalFilesDir(null)) {
+                        "External files dir is unavailable"
+                    }
+                    withContext(Dispatchers.Main) { onProgress?.invoke(RestoreProgress.REPLACING_EXTERNAL_FILES) }
+                    val preservedExternalLogNames = if (!manifest.includeLogs) logExternalTopLevelDirNames else emptySet()
+                    replaceDirContents(
+                        externalFilesPayloadDir,
+                        externalFilesDir,
+                        preservedTopLevelDirNames = preservedExternalLogNames,
+                    )
+                }
+                withContext(Dispatchers.Main) { onProgress?.invoke(RestoreProgress.REPLACING_SHARED_PREFS) }
+                replaceDirContents(File(payloadDir, "shared_prefs"), File(context.dataDir, "shared_prefs"))
+                withContext(Dispatchers.Main) { onProgress?.invoke(RestoreProgress.REPLACING_DATASTORE) }
+                replaceDirContents(File(payloadDir, "datastore"), File(context.dataDir, "datastore"))
+                withContext(Dispatchers.Main) { onProgress?.invoke(RestoreProgress.REPLACING_DATABASES) }
+                replaceDirContents(File(payloadDir, "databases"), File(context.dataDir, "databases"))
+
+                val resourceCopyResult = restoreSnapshotResources(resourceRestorePlans)
+                restoreResult = RestoreResult(
+                    restoredResourceCount = resourceCopyResult.restoredCount,
+                    skippedResourceCount = resourcePlanResult.skippedCount + resourceCopyResult.skippedCount,
+                )
+
+                withContext(Dispatchers.Main) { onProgress?.invoke(RestoreProgress.FINALIZING) }
+                AppLogger.i(TAG, "restore done: ${manifest.packageName}")
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "restore failed", e)
+                throw e
+            } finally {
+                try {
+                    cacheZip.delete()
+                } catch (_: Exception) {
+                }
+                try {
+                    workDir.deleteRecursively()
+                } catch (_: Exception) {
+                }
+            }
+            restoreResult
+        }
+    }
+
+    private fun extractZipToWorkDir(zipFile: File, workDir: File): Manifest {
+        val payloadRoot = File(workDir, "payload")
+        payloadRoot.mkdirs()
+
+        var manifestText: String? = null
+        var extractedPayloadFiles = 0
+
+        val buffer = ByteArray(64 * 1024)
+        val extractMs = measureTimeMillis {
+            ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
+                while (true) {
+                    val entry = zis.nextEntry ?: break
+                    val name = entry.name
+
+                    if (entry.isDirectory) {
+                        zis.closeEntry()
+                        continue
+                    }
+
+                    if (name == ENTRY_MANIFEST) {
+                        val bytes = zis.readBytesSafely(maxBytes = 512 * 1024)
+                        manifestText = bytes.toString(Charsets.UTF_8)
+                        zis.closeEntry()
+                        continue
+                    }
+
+                    if (!name.startsWith(ENTRY_PAYLOAD_PREFIX)) {
+                        zis.closeEntry()
+                        continue
+                    }
+
+                    val target = File(workDir, name)
+                    val workCanonical = workDir.canonicalFile
+                    val targetCanonical = target.canonicalFile
+                    if (!targetCanonical.path.startsWith(workCanonical.path + File.separator)) {
+                        zis.closeEntry()
+                        throw IllegalArgumentException("Invalid zip entry path: $name")
+                    }
+
+                    target.parentFile?.mkdirs()
+                    BufferedOutputStream(FileOutputStream(target)).use { output ->
+                        while (true) {
+                            val read = zis.read(buffer)
+                            if (read <= 0) break
+                            output.write(buffer, 0, read)
+                        }
+                    }
+
+                    extractedPayloadFiles++
+
+                    zis.closeEntry()
+                }
+            }
+        }
+
+        AppLogger.i(TAG, "restore extract done in ${extractMs}ms (payloadFiles=$extractedPayloadFiles)")
+
+        val manifest = manifestText?.let { json.decodeFromString(Manifest.serializer(), it) }
+            ?: throw IllegalArgumentException("Invalid backup zip: missing $ENTRY_MANIFEST")
+
+        if (manifest.formatVersion != FORMAT_VERSION) {
+            throw IllegalArgumentException("Unsupported backup version: ${manifest.formatVersion}")
+        }
+
+        if (!isSupportedSnapshotPackageName(manifest.packageName)) {
+            throw IllegalArgumentException("Backup package mismatch: ${manifest.packageName}")
+        }
+
+        return manifest
+    }
+
+    private fun addDirToZip(
+        zos: ZipOutputStream,
+        dir: File,
+        entryPrefix: String,
+        excludedTopLevelDirNames: Set<String> = emptySet(),
+        referencedResourcePaths: Set<String> = emptySet(),
+        pruneUnreferencedThemeMedia: Boolean = false,
+        totalFiles: Int = 0,
+        onPercentChanged: ((Int) -> Unit)? = null
+    ) {
+        if (!dir.exists() || !dir.isDirectory) return
+
+        val baseCanonical = dir.canonicalFile
+        val buffer = ByteArray(64 * 1024)
+        val writtenEntryNames = HashSet<String>()
+
+        var processedFiles = 0
+        var lastPercent = -1
+
+        dir.walkTopDown().onEnter { currentDir ->
+            !shouldPruneDirForZip(currentDir, dir, entryPrefix, excludedTopLevelDirNames)
+        }.forEach { f ->
+            if (!f.isFile) return@forEach
+
+            val canonical = f.canonicalFile
+            val referencedSkip =
+                referencedResourcePaths.isNotEmpty() && referencedResourcePaths.contains(canonical.path)
+            if (referencedSkip) {
+                AppLogger.i(TAG, "export skip referenced resource in raw copy: ${canonical.absolutePath}")
+                return@forEach
+            }
+            if (pruneUnreferencedThemeMedia &&
+                entryPrefix == ENTRY_FILES &&
+                isUnreferencedThemeMediaFlatFile(canonical, baseCanonical)
+            ) {
+                AppLogger.i(TAG, "export skip unreferenced theme media: ${canonical.name}")
+                return@forEach
+            }
+            if (shouldSkipForZip(canonical, baseCanonical, entryPrefix, excludedTopLevelDirNames)) {
+                if (canonical.name == "lock.mdb" && canonical.parentFile?.name?.startsWith("objectbox") == true) {
+                    AppLogger.w(TAG, "export skip objectbox lock file: ${canonical.absolutePath}")
+                }
+                return@forEach
+            }
+
+            val rel = canonical.path.substring(baseCanonical.path.length + 1)
+            val entryName = entryPrefix + rel.replace(File.separatorChar, '/')
+
+            if (!writtenEntryNames.add(entryName)) {
+                AppLogger.w(TAG, "export skip duplicate entry: $entryName")
+                return@forEach
+            }
+
+            zos.putNextEntry(ZipEntry(entryName))
+            BufferedInputStream(FileInputStream(canonical)).use { input ->
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    zos.write(buffer, 0, read)
+                }
+            }
+            zos.closeEntry()
+
+            if (totalFiles > 0 && onPercentChanged != null) {
+                processedFiles++
+                val percent = ((processedFiles * 100) / totalFiles).coerceIn(0, 100)
+                if (percent != lastPercent) {
+                    lastPercent = percent
+                    onPercentChanged(percent)
+                }
+            }
+        }
+    }
+
+    private fun prepareImageResources(
+        context: Context,
+        references: Set<RawSnapshotResourceReference>,
+    ): List<PreparedImageResource> {
+        val seenSourcePaths = HashSet<String>()
+        val usedSnapshotPaths = HashSet<String>()
+        val result = ArrayList<PreparedImageResource>()
+        references.forEach { reference ->
+            val localPath = reference.localPath ?: return@forEach
+            val source = File(localPath)
+            if (!source.isFile) return@forEach
+            val canonical = source.canonicalFile
+            if (!seenSourcePaths.add(canonical.path)) return@forEach
+            val extension = canonical.extension
+            val resourceDirectory = RawSnapshotResourceLayout.directoryFor(reference)
+            val baseSnapshotPath = resourceDirectory +
+                RawSnapshotResourceLayout.fileName(reference, extension)
+            var snapshotPath = baseSnapshotPath
+            var collisionIndex = 2
+            while (!usedSnapshotPaths.add(snapshotPath)) {
+                snapshotPath = resourceDirectory +
+                    RawSnapshotResourceLayout.fileName(reference, extension, collisionIndex)
+                collisionIndex++
+            }
+            if (snapshotPath != baseSnapshotPath) {
+                AppLogger.w(TAG, "resource snapshot path collision; using $snapshotPath")
+            }
+            val restoreLocation = restoreLocationFor(context, canonical)
+            result += PreparedImageResource(
+                source = canonical,
+                mapping = ResourceMapping(
+                    ownerType = reference.ownerType.name,
+                    kind = reference.kind.name,
+                    ownerId = reference.ownerId,
+                    ownerName = reference.ownerName,
+                    originalUri = reference.uri,
+                    snapshotPath = snapshotPath,
+                    restoreRoot = restoreLocation?.root,
+                    restoreRelativePath = restoreLocation?.relativePath,
+                ),
+            )
+        }
+        AppLogger.i(TAG, "prepare resources done (references=${references.size} files=${result.size})")
+        return result
+    }
+
+    private fun buildResourceRestorePlans(
+        context: Context,
+        manifest: Manifest,
+        workDir: File,
+    ): ResourceRestorePlanResult {
+        val seenOriginalUris = HashSet<String>()
+        val plans = mutableListOf<RawSnapshotResourceRestorePlan>()
+        var skippedCount = 0
+        manifest.resources.forEach { mapping ->
+            if (!seenOriginalUris.add(mapping.originalUri)) return@forEach
+
+            val snapshotFile = snapshotFileFor(workDir, mapping)
+            if (snapshotFile == null || !snapshotFile.isFile) {
+                AppLogger.w(TAG, "restore resource skip (snapshot file missing): ${mapping.snapshotPath}")
+                skippedCount++
+                return@forEach
+            }
+
+            val destination = restoreDestinationFor(mapping, context)
+            if (destination == null) {
+                AppLogger.w(TAG, "restore resource skip (unsupported originalUri): ${mapping.originalUri}")
+                skippedCount++
+                return@forEach
+            }
+
+            plans += RawSnapshotResourceRestorePlan(
+                originalUri = mapping.originalUri,
+                snapshotFile = snapshotFile,
+                destination = destination,
+                destinationUri = uriForDestination(mapping.originalUri, destination),
+            )
+        }
+        val rawResourceResult = RawSnapshotMediaRestore.collectPlans(
+            workDir = workDir,
+            sourcePackageName = manifest.packageName,
+            filesDir = context.filesDir,
+            externalFilesDir = context.getExternalFilesDir(null),
+            mappedPlans = plans,
+            mappedOriginalUris = seenOriginalUris,
+        )
+        plans += rawResourceResult.plans
+        skippedCount += rawResourceResult.skippedCount
+        return ResourceRestorePlanResult(plans = plans, skippedCount = skippedCount)
+    }
+
+    private fun snapshotFileFor(workDir: File, mapping: ResourceMapping): File? {
+        val payloadRoot = File(workDir, "payload").canonicalFile
+        val rawPath = mapping.snapshotPath.trimStart('/')
+        val relativePath = when {
+            rawPath.startsWith("payload/") -> rawPath.removePrefix("payload/")
+            rawPath.startsWith("resources/") -> rawPath
+            else -> return null
+        }
+        val candidate = File(payloadRoot, relativePath).canonicalFile
+        return candidate.takeIf { isWithin(payloadRoot, it) }
+    }
+
+    private fun restoreLocationFor(context: Context, source: File): RestoreLocation? {
+        val canonicalSource = source.canonicalFile
+        val dataRoot = context.dataDir.canonicalFile
+        if (isWithin(dataRoot, canonicalSource)) {
+            return RestoreLocation(
+                root = RESTORE_ROOT_APP_DATA,
+                relativePath = relativePathFrom(dataRoot, canonicalSource),
+            )
+        }
+
+        val externalRoot = context.getExternalFilesDir(null)?.canonicalFile
+        if (externalRoot != null && isWithin(externalRoot, canonicalSource)) {
+            return RestoreLocation(
+                root = RESTORE_ROOT_EXTERNAL_FILES,
+                relativePath = relativePathFrom(externalRoot, canonicalSource),
+            )
+        }
+        return null
+    }
+
+    private fun restoreSnapshotResources(resourceRestorePlans: List<RawSnapshotResourceRestorePlan>): ResourceRestoreCopyResult {
+        if (resourceRestorePlans.isEmpty()) {
+            AppLogger.i(TAG, "restore resources done (restored=0 skipped=0 total=0)")
+            return ResourceRestoreCopyResult(restoredCount = 0, skippedCount = 0)
+        }
+
+        var restored = 0
+        var skipped = 0
+        resourceRestorePlans.distinctBy { it.destination.canonicalPath }.forEach { plan ->
+            try {
+                // 旧快照媒体已随原始目录恢复，避免将大型图片和字体重复复制。
+                if (!plan.restoredWithPayload) {
+                    plan.destination.parentFile?.mkdirs()
+                    plan.snapshotFile.copyTo(plan.destination, overwrite = true)
+                }
+                check(plan.destination.isFile) { "Restored resource is missing: ${plan.destination.name}" }
+                restored++
+            } catch (e: Exception) {
+                AppLogger.w(TAG, "restore resource failed: ${plan.snapshotFile.name}", e)
+                skipped++
+            }
+        }
+        AppLogger.i(
+            TAG,
+            "restore resources done (restored=$restored skipped=$skipped total=${resourceRestorePlans.size})"
+        )
+        return ResourceRestoreCopyResult(restoredCount = restored, skippedCount = skipped)
+    }
+
+    private fun restoreDestinationFor(
+        mapping: ResourceMapping,
+        context: Context,
+    ): File? {
+        val configuredRoot = when (mapping.restoreRoot) {
+            RESTORE_ROOT_APP_DATA -> context.dataDir
+            RESTORE_ROOT_EXTERNAL_FILES -> context.getExternalFilesDir(null)
+            else -> null
+        }
+        val configuredRelativePath = mapping.restoreRelativePath
+        if (configuredRoot != null && !configuredRelativePath.isNullOrBlank()) {
+            return resolveWithin(configuredRoot, configuredRelativePath)
+        }
+
+        // Compatibility for manifests created before restoreRoot/restoreRelativePath was added.
+        return restoreLegacyDestination(mapping.originalUri, context)
+    }
+
+    private fun restoreLegacyDestination(originalUri: String, context: Context): File? {
+        val uri = runCatching { Uri.parse(originalUri) }.getOrNull() ?: return null
+        val path = when (uri.scheme?.lowercase()) {
+            null, "" -> originalUri
+            "file" -> uri.path
+            else -> null
+        } ?: return null
+        val normalizedPath = path.replace('\\', '/')
+        val candidate = runCatching { File(normalizedPath).canonicalFile }.getOrNull()
+        val knownRoots = listOfNotNull(
+            runCatching { context.filesDir.canonicalFile }.getOrNull(),
+            context.getExternalFilesDir(null)?.let { runCatching { it.canonicalFile }.getOrNull() },
+        )
+        candidate?.let { file ->
+            if (knownRoots.any { root -> isWithin(root, file) && file != root }) {
+                return file
+            }
+        }
+
+        val filesMarker = "/files/"
+        val markerIndex = normalizedPath.lastIndexOf(filesMarker)
+        if (markerIndex < 0) {
+            AppLogger.w(TAG, "restore legacy resource skip (path has no /files/ marker): $originalUri")
+            return null
+        }
+
+        val relativePath = normalizedPath.substring(markerIndex + filesMarker.length)
+        val isExternalFilesPath = normalizedPath.contains("/Android/data/") ||
+            normalizedPath.contains("/Android/media/")
+        val root = if (isExternalFilesPath) {
+            context.getExternalFilesDir(null)
+        } else {
+            context.filesDir
+        } ?: return null
+        return resolveWithin(root, relativePath)
+    }
+
+    private fun uriForDestination(originalUri: String, destination: File): String {
+        val scheme = runCatching { Uri.parse(originalUri).scheme?.lowercase() }.getOrNull()
+        return if (scheme.isNullOrBlank()) {
+            destination.path
+        } else {
+            Uri.fromFile(destination).toString()
+        }
+    }
+
+    private fun resolveWithin(root: File, relativePath: String): File? {
+        if (relativePath.isBlank() || relativePath.startsWith("/") || relativePath.contains('\u0000')) {
+            return null
+        }
+        val canonicalRoot = runCatching { root.canonicalFile }.getOrNull() ?: return null
+        val candidate = runCatching {
+            File(canonicalRoot, relativePath.replace('/', File.separatorChar)).canonicalFile
+        }.getOrNull() ?: return null
+        return candidate.takeIf { isWithin(canonicalRoot, it) && it != canonicalRoot }
+    }
+
+    private fun relativePathFrom(root: File, file: File): String {
+        return file.path.substring(root.path.length + 1).replace(File.separatorChar, '/')
+    }
+
+    private fun isWithin(root: File, file: File): Boolean {
+        return file.path == root.path || file.path.startsWith(root.path + File.separator)
+    }
+
+    private fun rewriteResourceUrisInExtractedPreferences(
+        workDir: File,
+        resourceRestorePlans: List<RawSnapshotResourceRestorePlan>,
+    ) {
+        if (resourceRestorePlans.isEmpty()) return
+        val replacements = linkedMapOf<String, String>()
+        resourceRestorePlans.forEach { plan ->
+            replacements.putIfAbsent(plan.originalUri, plan.destinationUri)
+        }
+        if (replacements.isEmpty()) return
+
+        var changedFiles = 0
+        RawSnapshotMediaRestore.preferenceFiles(workDir).forEach { file ->
+            if (rewritePreferenceFile(file, replacements)) changedFiles++
+        }
+
+        AppLogger.i(
+            TAG,
+            "rewrite resource URI references done (mappings=${replacements.size}, files=$changedFiles)"
+        )
+    }
+
+    private fun rewritePreferenceFile(
+        file: File,
+        replacements: Map<String, String>,
+    ): Boolean {
+        val original = file.readBytes()
+        val rewritten = if (file.name.endsWith(".preferences_pb")) {
+            RawSnapshotMediaRestore.rewritePreferences(original, replacements)
+        } else {
+            rewriteXmlPreferenceText(original.toString(Charsets.UTF_8), replacements)
+                .toByteArray(Charsets.UTF_8)
+        }
+        if (original.contentEquals(rewritten)) return false
+        file.writeBytes(rewritten)
+        return true
+    }
+
+    internal fun rewriteXmlPreferenceText(
+        text: String,
+        replacements: Map<String, String>,
+    ): String {
+        val xmlReplacements = linkedMapOf<String, String>()
+        replacements.forEach { (source, destination) ->
+            val escapedDestination = escapeXmlText(destination)
+            xmlReplacements[escapeXmlText(source)] = escapedDestination
+            xmlReplacements[source] = escapedDestination
+        }
+        return RawSnapshotMediaRestore.rewriteStringReferences(text, xmlReplacements)
+    }
+
+    private fun escapeXmlText(value: String): String {
+        return value
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&" + "quot;")
+            .replace("'", "&" + "apos;")
+    }
+
+    private fun isUnreferencedThemeMediaFlatFile(canonical: File, baseCanonical: File): Boolean {
+        if (canonical == baseCanonical || !canonical.path.startsWith(baseCanonical.path + File.separator)) {
+            return false
+        }
+        val rel = canonical.path.substring(baseCanonical.path.length + 1)
+        if (rel.contains('/')) return false
+        val name = canonical.name
+        return isThemeMediaFlatFileName(name)
+    }
+
+    private fun shouldPruneDirForZip(
+        currentDir: File,
+        baseDir: File,
+        entryPrefix: String,
+        excludedTopLevelDirNames: Set<String>
+    ): Boolean {
+        if (currentDir == baseDir) return false
+        val parent = currentDir.parentFile ?: return false
+        if (parent != baseDir) return false
+
+        val name = currentDir.name
+        if (excludedTopLevelDirNames.contains(name)) return true
+
+        if (entryPrefix == ENTRY_FILES) {
+            if (name.startsWith("sherpa-ncnn-")) return true
+        }
+
+        return false
+    }
+
+    private fun shouldSkipForZip(
+        canonical: File,
+        baseCanonical: File,
+        entryPrefix: String,
+        excludedTopLevelDirNames: Set<String>
+    ): Boolean {
+        if (!canonical.path.startsWith(baseCanonical.path + File.separator)) return true
+
+        if (canonical.name == "lock.mdb" && canonical.parentFile?.name?.startsWith("objectbox") == true) {
+            return true
+        }
+
+        val rel = canonical.path.substring(baseCanonical.path.length + 1)
+        val relNormalized = rel.replace(File.separatorChar, '/')
+        val top = relNormalized.substringBefore('/', missingDelimiterValue = relNormalized)
+        if (excludedTopLevelDirNames.isNotEmpty() && excludedTopLevelDirNames.contains(top)) {
+            return true
+        }
+
+        if (entryPrefix == ENTRY_FILES) {
+            if (top.startsWith("sherpa-ncnn-")) {
+                return true
+            }
+
+            // Exclude Ubuntu rootfs package (very large). Stored as a top-level file in filesDir.
+            if (!relNormalized.contains('/')) {
+                val name = relNormalized
+                if (name.startsWith("ubuntu-", ignoreCase = true) && name.endsWith(".tar.xz", ignoreCase = true)) {
+                    return true
+                }
+            }
+
+            if (!relNormalized.contains('/')) {
+                if (relNormalized.startsWith("memory_hnsw_") && relNormalized.endsWith(".idx")) {
+                    return true
+                }
+                if (relNormalized.startsWith("doc_index_") && relNormalized.endsWith(".hnsw")) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    private fun totalFilesForZip(
+        dir: File,
+        entryPrefix: String,
+        excludedTopLevelDirNames: Set<String>,
+        referencedResourcePaths: Set<String> = emptySet(),
+        pruneUnreferencedThemeMedia: Boolean = false,
+        onScannedCountChanged: ((Int) -> Unit)? = null
+    ): Int {
+        if (!dir.exists() || !dir.isDirectory) return 0
+        val baseCanonical = dir.canonicalFile
+        var total = 0
+
+        var lastReported = 0
+        var lastReportAtMs = 0L
+        dir.walkTopDown().onEnter { currentDir ->
+            !shouldPruneDirForZip(currentDir, dir, entryPrefix, excludedTopLevelDirNames)
+        }.forEach { f ->
+            if (!f.isFile) return@forEach
+            val canonical = f.canonicalFile
+            if (referencedResourcePaths.isNotEmpty() && referencedResourcePaths.contains(canonical.path)) {
+                return@forEach
+            }
+            if (pruneUnreferencedThemeMedia &&
+                entryPrefix == ENTRY_FILES &&
+                isUnreferencedThemeMediaFlatFile(canonical, baseCanonical)
+            ) {
+                return@forEach
+            }
+            if (shouldSkipForZip(canonical, baseCanonical, entryPrefix, excludedTopLevelDirNames)) return@forEach
+            total++
+
+            if (onScannedCountChanged != null) {
+                val now = System.currentTimeMillis()
+                if (total == 1 || total - lastReported >= 200 || now - lastReportAtMs >= 250L) {
+                    lastReported = total
+                    lastReportAtMs = now
+                    onScannedCountChanged(total)
+                }
+            }
+        }
+        return total
+    }
+
+    private fun replaceDirContents(
+        fromDir: File,
+        toDir: File,
+        preservedTopLevelDirNames: Set<String> = emptySet()
+    ) {
+        if (!toDir.exists()) {
+            toDir.mkdirs()
+        }
+
+        // A raw snapshot is a complete restore point. Keeping entries that are absent from the
+        // snapshot leaves newer migration markers behind and changes how restored data is read.
+        toDir.listFiles()?.forEach { existing ->
+            if (!preservedTopLevelDirNames.contains(existing.name)) {
+                if (!existing.deleteRecursively()) {
+                    AppLogger.w(TAG, "restore could not remove stale entry, will overwrite: ${existing.absolutePath}")
+                }
+            }
+        }
+
+        if (!fromDir.exists() || !fromDir.isDirectory) return
+        copyDir(fromDir, toDir, preservedTopLevelDirNames)
+    }
+
+    private fun copyDir(
+        fromDir: File,
+        toDir: File,
+        preservedTopLevelDirNames: Set<String>
+    ) {
+        val baseCanonical = fromDir.canonicalFile
+        fromDir.walkTopDown().forEach { f ->
+            val canonical = f.canonicalFile
+            if (!canonical.path.startsWith(baseCanonical.path + File.separator) && canonical != baseCanonical) {
+                return@forEach
+            }
+
+            if (canonical == baseCanonical) return@forEach
+
+            val rel = canonical.path.substring(baseCanonical.path.length + 1)
+            if (preservedTopLevelDirNames.isNotEmpty()) {
+                val relNormalized = rel.replace(File.separatorChar, '/')
+                val top = relNormalized.substringBefore('/', missingDelimiterValue = relNormalized)
+                if (preservedTopLevelDirNames.contains(top)) {
+                    return@forEach
+                }
+            }
+            val target = File(toDir, rel)
+
+            if (canonical.isDirectory) {
+                target.mkdirs()
+            } else if (canonical.isFile) {
+                target.parentFile?.mkdirs()
+                // DataStore observes this directory. Replacing an active preferences file by
+                // truncating it exposes a transient empty payload that can be persisted again.
+                val atomicFile = AtomicFile(target)
+                var output: FileOutputStream? = null
+                try {
+                    output = atomicFile.startWrite()
+                    canonical.inputStream().use { input -> input.copyTo(output) }
+                    atomicFile.finishWrite(output)
+                } catch (error: Throwable) {
+                    output?.let(atomicFile::failWrite)
+                    throw error
+                }
+            }
+        }
+    }
+
+    private fun ZipInputStream.readBytesSafely(maxBytes: Int): ByteArray {
+        // 此缓冲流用于有大小上限的 ZIP 文本读取，独立于偏好格式重写。
+        val out = ByteArrayOutputStream()
+        val buffer = ByteArray(16 * 1024)
+        while (true) {
+            val read = read(buffer)
+            if (read <= 0) break
+            if (out.size() + read > maxBytes) {
+                throw IllegalArgumentException("Zip entry too large")
+            }
+            out.write(buffer, 0, read)
+        }
+        return out.toByteArray()
+    }
+}

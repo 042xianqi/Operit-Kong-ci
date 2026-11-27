@@ -1,0 +1,21 @@
+{
+  "repository": "3316891527/Operit",
+  "version": "1.12.2+27",
+  "branches": [
+    "feat/chat-theme-editor-polish",
+    "feat/markdown-mermaid-preview",
+    "feat/operit-editor-commands",
+    "feat/subagent-collaboration",
+    "feat/subagent-interaction-prototype",
+    "feat/theme-input-placeholder",
+    "fix/browser-overlay-content-recursion",
+    "fix/chat-import-memory",
+    "fix/chat-processing-status-flicker",
+    "fix/shell-command-isolation",
+    "fix/terminal-file-observation",
+    "fix/upstream-small-fixes",
+    "fix/visit-web-timeouts-errors",
+    "fix/workspace-import-performance",
+    "test/release-27-integration"
+  ]
+}

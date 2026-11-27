@@ -1,0 +1,622 @@
+package com.ai.assistance.operit.services
+
+import com.ai.assistance.operit.core.chat.attachment.ImageAttachmentEditTarget
+
+import android.content.Context
+import com.ai.assistance.operit.util.logging.AppLogger
+import androidx.compose.ui.text.input.TextFieldValue
+import com.ai.assistance.operit.api.chat.EnhancedAIService
+import com.ai.assistance.operit.core.chat.attachment.AttachmentInfo
+import com.ai.assistance.operit.data.model.ChatMessage
+import com.ai.assistance.operit.core.chat.runtime.ChatTurnOptions
+import com.ai.assistance.operit.data.model.InputProcessingState
+import com.ai.assistance.operit.core.config.PromptFunctionType
+import com.ai.assistance.operit.services.core.ApiConfigDelegate
+import com.ai.assistance.operit.services.core.AttachmentDelegate
+import com.ai.assistance.operit.services.core.ChatSelectionMode
+import com.ai.assistance.operit.services.core.ChatHistoryDelegate
+import com.ai.assistance.operit.services.core.MessageCoordinationDelegate
+import com.ai.assistance.operit.services.core.MessageProcessingDelegate
+import com.ai.assistance.operit.services.core.TokenStatisticsDelegate
+import com.ai.assistance.operit.core.tools.runtime.AIToolHandler
+import com.ai.assistance.operit.ui.features.conversation.chat.viewmodel.UiStateDelegate
+import com.ai.assistance.operit.ui.features.conversation.workspace.process.WorkspaceChangeTracker
+import com.ai.assistance.operit.util.stream.SharedStream
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+
+/**
+ * 聊天服务核心类
+ * 
+ * 整合所有聊天业务逻辑，可被 FloatingChatService 或 ChatViewModel 使用
+ * 生命周期独立于 ViewModel，绑定到传入的 CoroutineScope
+ */
+class ChatServiceCore(
+    private val context: Context,
+    private val coroutineScope: CoroutineScope,
+    private val selectionMode: ChatSelectionMode = ChatSelectionMode.FOLLOW_GLOBAL
+) {
+    companion object {
+        private const val TAG = "ChatServiceCore"
+    }
+
+    // EnhancedAIService 实例（全局单例）
+    private var enhancedAiService: EnhancedAIService? = null
+
+    // 委托实例
+    private lateinit var messageProcessingDelegate: MessageProcessingDelegate
+    private lateinit var chatHistoryDelegate: ChatHistoryDelegate
+    private lateinit var apiConfigDelegate: ApiConfigDelegate
+    private lateinit var tokenStatisticsDelegate: TokenStatisticsDelegate
+    private lateinit var attachmentDelegate: AttachmentDelegate
+    private lateinit var uiStateDelegate: UiStateDelegate
+    private lateinit var messageCoordinationDelegate: MessageCoordinationDelegate
+
+    private class MessageSpeechBinding(
+        val shouldRead: () -> Boolean,
+        val speak: (String, Boolean) -> Unit,
+    )
+    private val speechBindingLock = Any()
+    private val defaultSpeechBinding = MessageSpeechBinding(
+        shouldRead = { apiConfigDelegate.enableAutoRead.value },
+        speak = { _, _ -> },
+    )
+    @Volatile private var speechBinding = defaultSpeechBinding
+    // 初始化状态
+    private var initialized = false
+
+    // 回调：当 EnhancedAIService 初始化或更新时
+    private var onEnhancedAiServiceReady: ((EnhancedAIService) -> Unit)? = null
+    
+    // 额外的 onTurnComplete 回调（用于悬浮窗通知应用等场景）
+    private var additionalOnTurnComplete: ((String?, Triple<Long, Long, Long>?) -> Unit)? = null
+    private var additionalOnTokenStatisticsCleared: ((String) -> Unit)? = null
+
+    private var uiBridge: ChatServiceUiBridge = EmptyChatServiceUiBridge
+    private val workspaceChangeTracker = WorkspaceChangeTracker.getInstance(context)
+    private val workspaceTrackerOwnerId = "${selectionMode.name}@${System.identityHashCode(this)}"
+
+    init {
+        AppLogger.d(TAG, "ChatServiceCore 初始化")
+        initializeDelegates()
+    }
+    
+    private fun initializeDelegates() {
+        // 初始化 UI 状态委托
+        uiStateDelegate = UiStateDelegate()
+        
+        // 初始化 API 配置委托
+        apiConfigDelegate = ApiConfigDelegate(
+            context = context,
+            coroutineScope = coroutineScope,
+            onConfigChanged = { service ->
+                enhancedAiService = service
+                // 当服务初始化后，设置 token 统计收集器
+                tokenStatisticsDelegate.setupCollectors()
+                // 通知外部监听者
+                onEnhancedAiServiceReady?.invoke(service)
+                AppLogger.d(TAG, "EnhancedAIService 已更新")
+            }
+        )
+
+        // 初始化 Token 统计委托
+        tokenStatisticsDelegate = TokenStatisticsDelegate(
+            coroutineScope = coroutineScope,
+            getEnhancedAiService = { enhancedAiService }
+        )
+
+        // 初始化附件委托
+        attachmentDelegate = AttachmentDelegate(
+            context = context,
+            toolHandler = AIToolHandler.getInstance(context)
+        )
+
+        // 初始化聊天历史委托
+        chatHistoryDelegate = ChatHistoryDelegate(
+            context = context,
+            coroutineScope = coroutineScope,
+            selectionMode = selectionMode,
+            onTokenStatisticsLoaded = { chatId, inputTokens, outputTokens, windowSize ->
+                tokenStatisticsDelegate.setTokenCounts(chatId, inputTokens, outputTokens, windowSize)
+            },
+            isTokenStatisticsLoaded = { chatId ->
+                tokenStatisticsDelegate.hasTokenStatistics(chatId)
+            },
+            onTokenStatisticsCleared = { chatId ->
+                tokenStatisticsDelegate.clearChatTokenStatistics(chatId)
+                additionalOnTokenStatisticsCleared?.invoke(chatId)
+            },
+            getEnhancedAiService = { enhancedAiService },
+            ensureAiServiceAvailable = {
+                // 确保 AI 服务可用
+                if (enhancedAiService == null) {
+                    enhancedAiService = EnhancedAIService.getInstance(context)
+                }
+            },
+            getChatStatistics = { chatId ->
+                val (inputTokens, outputTokens) = tokenStatisticsDelegate.getCumulativeTokenCounts(chatId)
+                val windowSize = tokenStatisticsDelegate.getLastCurrentWindowSize(chatId)
+                Triple(inputTokens, outputTokens, windowSize)
+            },
+            onScrollToBottom = {
+                messageProcessingDelegate.scrollToBottom()
+            }
+        )
+
+        coroutineScope.launch {
+            chatHistoryDelegate.currentChatId.collect { chatId ->
+                tokenStatisticsDelegate.setActiveChatId(chatId)
+                attachmentDelegate.setActiveDraftChat(chatId)
+                uiBridge.setActiveDraftChat(chatId)
+                if (::messageProcessingDelegate.isInitialized) {
+                    messageProcessingDelegate.setActiveDraftChat(chatId)
+                }
+                if (chatId != null) {
+                    tokenStatisticsDelegate.bindChatService(
+                        chatId,
+                        EnhancedAIService.getChatInstance(context, chatId)
+                    )
+                }
+            }
+        }
+
+        coroutineScope.launch {
+            val monitor = com.ai.assistance.operit.ui.features.conversation.workspace.changes.WorkspaceFileMonitor.get(context)
+            try {
+                combine(
+                    chatHistoryDelegate.currentChatId,
+                    chatHistoryDelegate.chatHistories
+                ) { chatId, histories ->
+                    histories.firstOrNull { it.id == chatId }
+                }.collect { chat ->
+                    monitor.updateOwner(workspaceTrackerOwnerId, chat?.id, chat?.workspace, chat?.workspaceEnv)
+                    workspaceChangeTracker.updateOwner(
+                        ownerId = workspaceTrackerOwnerId,
+                        chatId = chat?.id,
+                        workspacePath = chat?.workspace,
+                        workspaceEnv = chat?.workspaceEnv
+                    )
+                }
+            } finally {
+                monitor.clearOwner(workspaceTrackerOwnerId)
+            }
+        }
+
+        // 初始化消息处理委托
+        messageProcessingDelegate = MessageProcessingDelegate(
+            context = context,
+            coroutineScope = coroutineScope,
+            getEnhancedAiService = { enhancedAiService },
+            getFullChatHistory = { chatId -> chatHistoryDelegate.getChatHistory(chatId) },
+            getRuntimeChatHistory = { chatId -> chatHistoryDelegate.getRuntimeChatHistory(chatId) },
+            hasUserMessage = { chatId -> chatHistoryDelegate.hasUserMessage(chatId) },
+            addMessageToChat = { chatId, message ->
+                chatHistoryDelegate.addMessageToChat(message, chatId)
+            },
+            resolveVoiceMessage = { chatId, source, text ->
+                chatHistoryDelegate.resolveVoiceMessage(chatId, source, text)
+            },
+            retractStreamingMessages = { chatId, timestamps ->
+                chatHistoryDelegate.retractStreamingMessages(chatId, timestamps)
+            },
+            saveCurrentChat = { chatId ->
+                chatHistoryDelegate.saveChatStatistics(chatId)
+            },
+            showErrorMessage = { error ->
+                AppLogger.e(TAG, "错误: $error")
+                // 错误消息可以通过回调传递给 UI
+            },
+            updateChatTitle = { chatId, title ->
+                chatHistoryDelegate.updateChatTitle(chatId, title)
+            },
+            getChatTitle = { chatId ->
+                chatHistoryDelegate.chatHistories.value.firstOrNull { it.id == chatId }?.title
+            },
+            onTurnComplete = turnComplete@ { chatId, service, nextWindowSize, turnOptions ->
+                // 首轮累加前恢复持久化统计，后台会话同样需要已有的累计基数。
+                val statisticsLoaded = if (chatId == null) {
+                    true
+                } else {
+                    try {
+                        chatHistoryDelegate.ensureTokenStatisticsLoaded(chatId)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        AppLogger.w(TAG, "会话统计恢复失败: chatId=$chatId", e)
+                        false
+                    }
+                }
+                if (!statisticsLoaded) {
+                    AppLogger.w(TAG, "会话统计尚未恢复，跳过本轮统计保存: chatId=$chatId")
+                    additionalOnTurnComplete?.invoke(chatId, null)
+                    return@turnComplete
+                }
+                val usageBreakdown = service.getCurrentTurnUsageBreakdown()
+                val (previousInput, previousOutput) = tokenStatisticsDelegate.getCumulativeTokenCounts(chatId)
+                val inputTokens = previousInput + usageBreakdown.inputTokens
+                val outputTokens = previousOutput + usageBreakdown.outputTokens
+                val windowSize = nextWindowSize ?: tokenStatisticsDelegate.getLastCurrentWindowSize(chatId)
+                // 先将总额与分类一起入库，避免切换会话的普通保存抢先把本轮输入记入其他。
+                if (turnOptions.persistTurn) {
+                    chatHistoryDelegate.saveCurrentChat(
+                        inputTokens,
+                        outputTokens,
+                        windowSize,
+                        chatIdOverride = chatId,
+                        usageBreakdown = usageBreakdown,
+                    )
+                }
+                tokenStatisticsDelegate.setTokenCounts(chatId, inputTokens, outputTokens, windowSize)
+                additionalOnTurnComplete?.invoke(chatId, Triple(inputTokens, outputTokens, windowSize))
+            },
+            getIsAutoReadEnabled = { speechBinding.shouldRead() },
+            speakMessageHandler = { text, interrupt -> speechBinding.speak(text, interrupt) },
+            onTokenLimitExceeded = { chatId, roleCardId, isGroupOrchestrationTurn, groupParticipantNamesText ->
+                messageCoordinationDelegate.handleTokenLimitExceeded(
+                    chatId = chatId,
+                    roleCardId = roleCardId,
+                    isGroupOrchestrationTurn = isGroupOrchestrationTurn,
+                    groupParticipantNamesText = groupParticipantNamesText
+                )
+            }
+        )
+        messageProcessingDelegate.setActiveDraftChat(chatHistoryDelegate.currentChatId.value)
+
+        // 初始化消息协调委托
+        messageCoordinationDelegate = MessageCoordinationDelegate(
+            context = context,
+            coroutineScope = coroutineScope,
+            chatHistoryDelegate = chatHistoryDelegate,
+            messageProcessingDelegate = messageProcessingDelegate,
+            tokenStatsDelegate = tokenStatisticsDelegate,
+            apiConfigDelegate = apiConfigDelegate,
+            attachmentDelegate = attachmentDelegate,
+            uiStateDelegate = uiStateDelegate,
+            getEnhancedAiService = { enhancedAiService },
+            uiBridge = uiBridge
+        )
+
+        chatHistoryDelegate.setBeforeDestructiveHistoryMutation { chatId ->
+            messageCoordinationDelegate.cancelSummaryForDestructiveMutation(chatId)
+            messageProcessingDelegate.cancelMessageForDestructiveMutation(chatId)
+        }
+        chatHistoryDelegate.setAfterDestructiveHistoryMutation { chatId ->
+            messageCoordinationDelegate.scheduleStableContextWindowRefresh(chatId = chatId)
+        }
+
+        initialized = true
+        AppLogger.d(TAG, "所有委托已初始化")
+    }
+
+    // ========== 消息处理相关 ==========
+
+    /** 发送用户消息（使用 MessageCoordinationDelegate，包含总结逻辑） */
+    fun sendUserMessage(
+        promptFunctionType: PromptFunctionType = PromptFunctionType.CHAT,
+        roleCardIdOverride: String? = null,
+        chatIdOverride: String? = null,
+        messageTextOverride: String? = null,
+        proxySenderNameOverride: String? = null,
+        chatModelConfigIdOverride: String? = null,
+        chatModelIndexOverride: Int? = null,
+        turnOptions: ChatTurnOptions = ChatTurnOptions(),
+        preferActiveRoleCard: Boolean = false,
+    ) {
+        messageCoordinationDelegate.sendUserMessage(
+            promptFunctionType = promptFunctionType,
+            roleCardIdOverride = roleCardIdOverride,
+            preferActiveRoleCard = preferActiveRoleCard,
+            chatIdOverride = chatIdOverride,
+            messageTextOverride = messageTextOverride,
+            proxySenderNameOverride = proxySenderNameOverride,
+            chatModelConfigIdOverride = chatModelConfigIdOverride,
+            chatModelIndexOverride = chatModelIndexOverride,
+            turnOptions = turnOptions
+        )
+    }
+
+    /** 取消当前消息 */
+    fun cancelCurrentMessage() {
+        // 先取消总结（如果正在进行）
+        messageCoordinationDelegate.cancelSummary()
+        // 然后取消“当前聊天”的消息处理
+        val chatId = chatHistoryDelegate.currentChatId.value
+        if (chatId != null) {
+            messageProcessingDelegate.cancelMessage(chatId)
+        }
+    }
+
+    fun cancelMessage(chatId: String) {
+        messageCoordinationDelegate.cancelSummaryForChat(chatId)
+        messageProcessingDelegate.cancelMessage(chatId)
+    }
+
+    suspend fun cancelMessageForDestructiveMutation(chatId: String) {
+        messageCoordinationDelegate.cancelSummaryForDestructiveMutation(chatId)
+        messageProcessingDelegate.cancelMessageForDestructiveMutation(chatId)
+    }
+
+    /** 更新用户消息 */
+    fun updateUserMessage(message: String) {
+        messageProcessingDelegate.updateUserMessage(message)
+    }
+
+    fun getResponseStream(chatId: String): SharedStream<String>? {
+        return messageProcessingDelegate.getResponseStream(chatId)
+    }
+
+    // ========== 聊天历史相关 ==========
+
+    /** 创建新的聊天 */
+    fun createNewChat(
+        characterCardName: String? = null,
+        group: String? = null,
+        inheritGroupFromCurrent: Boolean = true,
+        setAsCurrentChat: Boolean = true,
+        characterCardId: String? = null
+    ) {
+        chatHistoryDelegate.createNewChat(
+            characterCardName = characterCardName,
+            group = group,
+            inheritGroupFromCurrent = inheritGroupFromCurrent,
+            setAsCurrentChat = setAsCurrentChat,
+            characterCardId = characterCardId
+        )
+    }
+
+    /** 切换聊天 */
+    fun switchChat(chatId: String) {
+        chatHistoryDelegate.switchChat(chatId)
+    }
+
+    /**
+     * 切换聊天（仅切换本地状态，不写回全局 currentChatId）。
+     * 悬浮窗可用此方法在窗口内切换会话，但不影响主界面。
+     */
+    fun switchChatLocal(chatId: String) {
+        chatHistoryDelegate.switchChat(chatId, syncToGlobal = false)
+    }
+
+    /**
+     * 将当前本地 chatId 写回全局 currentChatId，用于“返回主应用”时同步。
+     */
+    fun syncCurrentChatIdToGlobal() {
+        val chatId = chatHistoryDelegate.currentChatId.value ?: return
+        chatHistoryDelegate.switchChat(chatId, syncToGlobal = true)
+    }
+
+    /** 删除聊天历史 */
+    fun deleteChatHistory(chatId: String) {
+        chatHistoryDelegate.deleteChatHistory(chatId)
+    }
+
+    /** 删除消息 */
+    fun deleteMessage(index: Int) {
+        chatHistoryDelegate.deleteMessage(index)
+    }
+
+    /** 清空当前聊天 */
+    fun clearCurrentChat() {
+        chatHistoryDelegate.clearCurrentChat()
+    }
+
+    /** 更新聊天标题 */
+    fun updateChatTitle(chatId: String, title: String) {
+        chatHistoryDelegate.updateChatTitle(chatId, title)
+    }
+
+    // ========== Token 统计相关 ==========
+
+    /** 重置 token 统计 */
+    fun resetTokenStatistics() {
+        tokenStatisticsDelegate.resetTokenStatistics()
+    }
+
+    /** 更新累计统计 */
+    fun updateCumulativeStatistics() {
+        tokenStatisticsDelegate.updateCumulativeStatistics()
+    }
+
+    // ========== 附件管理相关 ==========
+
+    /** 获取 AttachmentDelegate 实例 */
+    fun getAttachmentDelegate(): AttachmentDelegate = attachmentDelegate
+
+    /** 添加附件 */
+    suspend fun handleAttachment(filePath: String) {
+        attachmentDelegate.handleAttachment(filePath)
+    }
+
+    /** 移除附件 */
+    fun createImageAttachmentEditTarget(original: AttachmentInfo): ImageAttachmentEditTarget =
+        attachmentDelegate.createImageAttachmentEditTarget(original)
+
+    fun removeAttachment(filePath: String) {
+        attachmentDelegate.removeAttachment(filePath)
+    }
+
+    /** 清空所有附件 */
+    fun clearAttachments() {
+        attachmentDelegate.clearAttachments()
+    }
+
+    // ========== StateFlow 暴露 ==========
+
+    // 消息处理相关
+    val userMessage: StateFlow<TextFieldValue>
+        get() = messageProcessingDelegate.userMessage
+
+    val isLoading: StateFlow<Boolean>
+        get() = messageProcessingDelegate.isLoading
+
+    val activeStreamingChatIds: StateFlow<Set<String>>
+        get() = messageProcessingDelegate.activeStreamingChatIds
+
+    val inputProcessingStateByChatId: StateFlow<Map<String, InputProcessingState>>
+        get() = messageProcessingDelegate.inputProcessingStateByChatId
+
+    val currentTurnToolInvocationCountByChatId: StateFlow<Map<String, Int>>
+        get() = messageProcessingDelegate.currentTurnToolInvocationCountByChatId
+
+    val scrollToBottomEvent: SharedFlow<Unit>
+        get() = messageProcessingDelegate.scrollToBottomEvent
+
+    val nonFatalErrorEvent: SharedFlow<String>
+        get() = messageProcessingDelegate.nonFatalErrorEvent
+
+    val isSummarizing: StateFlow<Boolean>
+        get() = messageCoordinationDelegate.isSummarizing
+
+    // 聊天历史相关
+    val chatHistory: StateFlow<List<ChatMessage>>
+        get() = chatHistoryDelegate.chatHistory
+
+    val currentChatId: StateFlow<String?>
+        get() = chatHistoryDelegate.currentChatId
+
+    val currentChatHasOlderDisplayHistory: StateFlow<Boolean>
+        get() = chatHistoryDelegate.hasOlderDisplayHistory
+
+    val currentChatHasNewerDisplayHistory: StateFlow<Boolean>
+        get() = chatHistoryDelegate.hasNewerDisplayHistory
+
+    val currentChatIsLoadingDisplayWindow: StateFlow<Boolean>
+        get() = chatHistoryDelegate.isLoadingDisplayWindow
+
+    val chatHistories: StateFlow<List<com.ai.assistance.operit.data.model.ChatHistory>>
+        get() = chatHistoryDelegate.chatHistories
+
+
+    // API 配置相关
+    val enableThinkingMode: StateFlow<Boolean>
+        get() = apiConfigDelegate.enableThinkingMode
+
+    val enableMemoryAutoUpdate: StateFlow<Boolean>
+        get() = apiConfigDelegate.enableMemoryAutoUpdate
+
+    val enableAutoRead: StateFlow<Boolean>
+        get() = apiConfigDelegate.enableAutoRead
+
+    val contextLength: StateFlow<Float>
+        get() = apiConfigDelegate.effectiveContextLength
+
+    val summaryTokenThreshold: StateFlow<Float>
+        get() = apiConfigDelegate.effectiveSummaryTokenThreshold
+
+    val enableSummary: StateFlow<Boolean>
+        get() = apiConfigDelegate.effectiveEnableSummary
+
+    val enableTools: StateFlow<Boolean>
+        get() = apiConfigDelegate.enableTools
+
+    // Token 统计相关
+    val cumulativeInputTokensFlow: StateFlow<Long>
+        get() = tokenStatisticsDelegate.cumulativeInputTokensFlow
+
+    val cumulativeOutputTokensFlow: StateFlow<Long>
+        get() = tokenStatisticsDelegate.cumulativeOutputTokensFlow
+
+    val currentWindowSizeFlow: StateFlow<Long>
+        get() = tokenStatisticsDelegate.currentWindowSizeFlow
+
+    val perRequestTokenCountFlow: StateFlow<Pair<Long, Long>?>
+        get() = tokenStatisticsDelegate.perRequestTokenCountFlow
+
+    // 附件相关
+    val attachments: StateFlow<List<AttachmentInfo>>
+        get() = attachmentDelegate.attachments
+
+
+    // ========== 其他方法 ==========
+
+    /** 获取 UiStateDelegate 实例 */
+    fun getUiStateDelegate(): UiStateDelegate = uiStateDelegate
+
+    fun getApiConfigDelegate(): ApiConfigDelegate = apiConfigDelegate
+
+    fun getTokenStatisticsDelegate(): TokenStatisticsDelegate = tokenStatisticsDelegate
+
+    fun getChatHistoryDelegate(): ChatHistoryDelegate = chatHistoryDelegate
+
+    fun getMessageProcessingDelegate(): MessageProcessingDelegate = messageProcessingDelegate
+
+    fun getMessageCoordinationDelegate(): MessageCoordinationDelegate = messageCoordinationDelegate
+
+    /** 获取 EnhancedAIService 实例 */
+    fun getEnhancedAiService(): EnhancedAIService? = enhancedAiService
+
+    /** 检查是否已初始化 */
+    fun isInitialized(): Boolean = initialized
+    
+    /** 设置 EnhancedAIService 就绪回调 */
+    fun setOnEnhancedAiServiceReady(callback: (EnhancedAIService) -> Unit) {
+        onEnhancedAiServiceReady = callback
+        // 如果已经初始化，立即调用回调
+        enhancedAiService?.let { callback(it) }
+    }
+    
+    /** 设置额外的 onTurnComplete 回调（用于悬浮窗通知应用等场景） */
+    fun setAdditionalOnTurnComplete(callback: ((chatId: String?, statistics: Triple<Long, Long, Long>?) -> Unit)?) {
+        additionalOnTurnComplete = callback
+    }
+
+    /** 同步显式清空后的统计，防止其他运行时重新保存旧累计。 */
+    fun setAdditionalOnTokenStatisticsCleared(callback: (String) -> Unit) {
+        additionalOnTokenStatisticsCleared = callback
+    }
+
+    fun setUiBridge(uiBridge: ChatServiceUiBridge) {
+        this.uiBridge = uiBridge
+        uiBridge.setActiveDraftChat(chatHistoryDelegate.currentChatId.value)
+        if (::messageCoordinationDelegate.isInitialized) {
+            messageCoordinationDelegate.setUiBridge(uiBridge)
+        }
+    }
+
+    fun setSpeakMessageHandler(handler: (String, Boolean) -> Unit) {
+        synchronized(speechBindingLock) {
+            speechBinding = MessageSpeechBinding(defaultSpeechBinding.shouldRead, handler)
+        }
+    }
+
+    /** 通话只绑定本运行时的朗读条件，不改写普通聊天的自动朗读偏好。 */
+    fun bindMessageSpeech(
+        shouldRead: () -> Boolean,
+        speak: (String, Boolean) -> Unit,
+    ): () -> Unit {
+        val binding = MessageSpeechBinding(shouldRead, speak)
+        synchronized(speechBindingLock) { speechBinding = binding }
+        return {
+            synchronized(speechBindingLock) {
+                // 旧界面释放时不能清掉后来绑定的新界面。
+                if (speechBinding === binding) speechBinding = defaultSpeechBinding
+            }
+        }
+    }
+    
+    /** 重新加载聊天消息（智能合并） */
+    suspend fun reloadChatMessagesSmart(chatId: String) {
+        chatHistoryDelegate.reloadChatMessagesSmart(chatId)
+    }
+
+    fun loadOlderMessagesForCurrentChat() {
+        coroutineScope.launch {
+            chatHistoryDelegate.loadOlderMessagesForCurrentChat()
+        }
+    }
+
+    fun loadNewerMessagesForCurrentChat() {
+        coroutineScope.launch {
+            chatHistoryDelegate.loadNewerMessagesForCurrentChat()
+        }
+    }
+
+    fun showLatestMessagesForCurrentChat() {
+        coroutineScope.launch {
+            chatHistoryDelegate.showLatestMessagesForCurrentChat()
+        }
+    }
+}

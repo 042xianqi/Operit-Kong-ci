@@ -1,0 +1,38 @@
+# Project-wide Gradle settings.
+# IDE (e.g. Android Studio) users:
+# Gradle settings configured through the IDE *will override*
+# any settings specified in this file.
+# For more details on how to configure your build environment visit
+# http://www.gradle.org/docs/current/userguide/build_environment.html
+#
+# 本机规格：8 逻辑核 / 6.9 GiB 物理内存。以下数值按这台机器定，不是通用推荐值。
+#
+# -Xmx3072m：构建期实测（jcmd GC.heap_info + 进程私有内存）Gradle daemon 堆峰值
+#   1.15 GB / 已提交峰值 1.29 GB；同期 Kotlin daemon 私有内存从 2.5 GB 涨到 4.35 GB，
+#   两个 JVM 合计 6.7 GB，而物理内存只有 6.9 GB。原来的 -Xmx8192m 高于物理内存，
+#   峰值时只能靠 pagefile，构建时间的抖动就来自这里。
+org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
+# Kotlin daemon 显式定量：不限时实测私有内存 5.29 GB（kapt 在同进程里跑 javac）。
+# 压到 3072m 会撞上限：实测 ParOldGen 2097152K 用到 99%，整段编译在 full GC 里打转，
+# 因此定格 4096m —— 允许它完整驻留堆，代价是与 Gradle daemon 合计可能短暂超出物理内存。
+kotlin.daemon.jvmargs=-Xmx4096m
+# 8 核机器：worker 是 CPU-bound，超过核数只会增加上下文切换。
+org.gradle.workers.max=8
+# 多模块（app + terminal + 6 个库）时有用；Gradle 会按任务依赖自行串行化。
+org.gradle.parallel=true
+org.gradle.daemon=true
+org.gradle.caching=true
+# configureondemand 是 incubating 特性，且与 configuration cache 不兼容；单模块
+# :app:assembleDebug 场景下它只是「少配置几个项目」，对总耗时没有可测收益，已移除。
+# AndroidX package structure to make it clearer which packages are bundled with the
+# Android operating system, and which are packaged with your app's APK
+# https://developer.android.com/topic/libraries/support-library/androidx-rn
+android.useAndroidX=true
+# Kotlin code style for this project: "official" or "obsolete":
+kotlin.code.style=official
+# Enables namespacing of each library's R class so that its R class includes only the
+# resources declared in the library itself and none from the library's dependencies,
+# thereby reducing the size of the R class for that library
+android.nonTransitiveRClass=true
+# kapt 仍在使用（Room compiler + ObjectBox processor）：不含编译 classpath 可少算一份输入。
+kapt.include.compile.classpath=false

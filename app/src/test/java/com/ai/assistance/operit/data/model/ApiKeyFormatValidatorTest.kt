@@ -1,0 +1,91 @@
+package com.ai.assistance.operit.data.model
+
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import com.ai.assistance.operit.api.chat.keypool.ApiKeyAvailabilityStatus
+import com.ai.assistance.operit.api.chat.keypool.ApiKeyFormatValidator
+import com.ai.assistance.operit.api.chat.keypool.ApiKeyInfo
+import com.ai.assistance.operit.data.config.model.ModelConfigData
+
+class ApiKeyFormatValidatorTest {
+    @Test
+    fun outerWhitespace_isNormalized() {
+        assertTrue(ApiKeyFormatValidator.isValid("  sk-test_123+/=  "))
+    }
+
+    @Test
+    fun nonAsciiCharacters_areRejected() {
+        assertFalse(ApiKeyFormatValidator.isValid("中文密钥"))
+        assertFalse(ApiKeyFormatValidator.isValid("sk-fullwidth-Ａ"))
+        assertFalse(ApiKeyFormatValidator.isValid("sk-emoji-😀"))
+    }
+
+    @Test
+    fun whitespaceAndControlCharacters_areRejected() {
+        assertFalse(ApiKeyFormatValidator.isValid("sk-internal space"))
+        assertFalse(ApiKeyFormatValidator.isValid("sk-tab\tvalue"))
+        assertFalse(ApiKeyFormatValidator.isValid("sk-line\nvalue"))
+        assertFalse(ApiKeyFormatValidator.isValid("sk-null\u0000value"))
+    }
+
+    @Test
+    fun availableKeyPool_isAcceptedWithoutSingleKey() {
+        val config =
+            ModelConfigData(
+                id = "pool",
+                name = "Pool",
+                useMultipleApiKeys = true,
+                apiKeyPool =
+                    listOf(
+                        ApiKeyInfo(
+                            id = "key-1",
+                            key = "sk-valid",
+                            availabilityStatus = ApiKeyAvailabilityStatus.AVAILABLE
+                        )
+                    )
+            )
+
+        assertTrue(ApiKeyFormatValidator.hasUsableKey(config))
+    }
+
+    @Test
+    fun invalidEnabledPoolEntry_rejectsWholePool() {
+        val config =
+            ModelConfigData(
+                id = "pool",
+                name = "Pool",
+                useMultipleApiKeys = true,
+                apiKeyPool =
+                    listOf(
+                        ApiKeyInfo(id = "key-1", key = "sk-valid"),
+                        ApiKeyInfo(id = "key-2", key = "中文")
+                    )
+            )
+
+        assertFalse(ApiKeyFormatValidator.hasUsableKey(config))
+    }
+    @Test
+    fun disabledPoolIgnoresStoredInvalidEntries() {
+        val config = ModelConfigData(
+            id = "single", name = "单密钥", apiKey = "sk-single",
+            useMultipleApiKeys = false,
+            apiKeyPool = listOf(ApiKeyInfo("old", "中文")),
+        )
+        assertTrue(ApiKeyFormatValidator.hasUsableKey(config))
+    }
+    @Test
+    fun emptyAndBlankPoolsValidateTheSingleKey() {
+        for (pool in listOf(emptyList(), listOf(ApiKeyInfo(
+            id = "blank", key = "  ", availabilityStatus = ApiKeyAvailabilityStatus.UNAVAILABLE,
+        )))) {
+            val config = ModelConfigData(
+                id = "empty", name = "空池", apiKey = "sk-single",
+                useMultipleApiKeys = true, apiKeyPool = pool,
+            )
+            assertTrue(ApiKeyFormatValidator.hasUsableKey(config))
+            assertFalse(ApiKeyFormatValidator.hasUsableKey(config.copy(apiKey = "")))
+        }
+    }
+
+}

@@ -1,0 +1,310 @@
+from __future__ import annotations
+
+import sys
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "ci" / "script"))
+
+from pr_check import candidate_context, changed_paths, classify_paths  # noqa: E402
+
+
+def git(repository: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+class ScopeClassificationTest(unittest.TestCase):
+    def test_translation_only_uses_resource_lane(self) -> None:
+        plan = classify_paths(
+            [
+                "app/src/main/res/values-ro/strings.xml",
+                "app/src/main/res/xml/locales_config.xml",
+            ]
+        )
+
+        self.assertTrue(plan.localization)
+        self.assertTrue(plan.android_resources)
+        self.assertFalse(plan.android_jvm)
+        self.assertFalse(plan.android_full)
+        self.assertFalse(plan.docs)
+
+    def test_default_strings_use_jvm_lane(self) -> None:
+        plan = classify_paths(["app/src/main/res/values/strings.xml"])
+
+        self.assertTrue(plan.localization)
+        self.assertFalse(plan.android_resources)
+        self.assertTrue(plan.android_jvm)
+        self.assertFalse(plan.android_full)
+
+    def test_native_change_uses_full_lane(self) -> None:
+        plan = classify_paths(["cmake/operit_git_source.cmake"])
+
+        self.assertFalse(plan.android_resources)
+        self.assertFalse(plan.android_jvm)
+        self.assertTrue(plan.android_full)
+
+    def test_terminal_command_sources_use_full_lane(self) -> None:
+        for path in (
+            "tools/native_apply_patch/src/lib.rs",
+            "tools/native_apply_patch/install.sh",
+            "tools/native_apply_patch/Cargo.lock",
+            "tools/web_chat_cli/src/client.rs",
+            "tools/web_chat_cli/install.sh",
+            "tools/web_chat_cli/package_assets.py",
+            "tools/web_chat_cli/Cargo.lock",
+            "tools/html_build_cli/src/main.rs",
+            "tools/html_build_cli/install.sh",
+            "tools/html_build_cli/package_assets.py",
+            "tools/html_build_cli/Cargo.lock",
+            "tools/terminal_commands/verify_assets.py",
+            "tools/terminal_commands/rust-toolchain.toml",
+            ".github/actions/terminal-commands/action.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(classify_paths([path]).android_full)
+
+    def test_android_workflow_changes_use_full_lane(self) -> None:
+        for path in (
+            ".github/workflows/build.yml",
+            ".github/workflows/android-tests.yml",
+            ".github/workflows/pr-check.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(classify_paths([path]).android_full)
+
+    def test_relocated_native_modules_use_full_lane(self) -> None:
+        for path in (
+            "modules/llm/llama/CMakeLists.txt",
+            "modules/llm/mnn/CMakeLists.txt",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(classify_paths([path]).android_full)
+
+    def test_upstream_only_docs_are_not_part_of_candidate_paths(self) -> None:
+        plan = classify_paths(["app/src/main/res/values-ro/strings.xml"])
+
+        self.assertFalse(plan.docs)
+
+    def test_rename_source_and_destination_cover_both_scopes(self) -> None:
+        plan = classify_paths(
+            [
+                "app/web-chat/src/legacy.tsx",
+                "app/src/main/java/com/example/Current.kt",
+            ]
+        )
+
+        self.assertTrue(plan.web)
+        self.assertTrue(plan.android_jvm)
+
+    def test_web_chat_under_app_stays_out_of_android_lanes(self) -> None:
+        plan = classify_paths(["app/web-chat/src/legacy.tsx"])
+        self.assertTrue(plan.web)
+        self.assertFalse(plan.android_jvm)
+        self.assertFalse(plan.android_resources)
+        self.assertFalse(plan.android_full)
+    def test_type_change_path_is_classified_normally(self) -> None:
+        plan = classify_paths(["app/src/main/java/com/example/Current.kt"])
+
+        self.assertTrue(plan.android_jvm)
+
+    def test_issue_form_yaml_uses_yaml_lane(self) -> None:
+        plan = classify_paths([".github/ISSUE_TEMPLATE/bug.yml"])
+
+        self.assertTrue(plan.yaml)
+        self.assertFalse(plan.ci)
+
+    def test_root_npm_configuration_uses_javascript_lanes(self) -> None:
+        plan = classify_paths([".npmrc", "npm-shrinkwrap.json"])
+
+        self.assertTrue(plan.web)
+        self.assertTrue(plan.toolpkg)
+
+    def test_android_test_source_uses_instrumentation_compile(self) -> None:
+        plan = classify_paths(["app/src/androidTest/java/com/example/ExampleTest.kt"])
+
+        self.assertTrue(plan.android_jvm)
+        self.assertTrue(plan.android_instrumentation)
+
+
+class FullAndroidRequirementTest(unittest.TestCase):
+    def test_explicit_request_requires_full_android_for_every_scope(self) -> None:
+        for paths in (
+            [],
+            ["README.md"],
+            ["ci/script/pr_check.py"],
+            ["app/src/main/java/com/example/Current.kt"],
+            ["app/src/main/res/values-ro/strings.xml"],
+        ):
+            with self.subTest(paths=paths):
+                plan = classify_paths(paths, full_android=True)
+                self.assertTrue(plan.android_full)
+                self.assertFalse(plan.android_jvm)
+                self.assertFalse(plan.android_resources)
+                self.assertEqual(plan.output_values()["android_full"], "true")
+
+    def test_cli_outputs_required_full_lane_for_docs_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            git(repository, "init", "-b", "main")
+            git(repository, "config", "user.name", "CI Test")
+            git(repository, "config", "user.email", "ci@example.com")
+            (repository / "README.md").write_text("base\n", encoding="utf-8")
+            git(repository, "add", "README.md")
+            git(repository, "commit", "-m", "base")
+            base_sha = git(repository, "rev-parse", "HEAD")
+            git(repository, "switch", "-c", "feature")
+            (repository / "README.md").write_text("updated docs\n", encoding="utf-8")
+            git(repository, "commit", "-am", "docs")
+            head_sha = git(repository, "rev-parse", "HEAD")
+            git(repository, "switch", "main")
+            git(repository, "merge", "--no-ff", "feature", "-m", "candidate")
+            candidate_sha = git(repository, "rev-parse", "HEAD")
+            output = repository / "outputs.txt"
+            subprocess.run(
+                [sys.executable, str(REPO_ROOT / "ci/script/pr_check.py"), "plan",
+                 "--candidate", candidate_sha, "--expected-base", base_sha,
+                 "--expected-head", head_sha, "--full-android", "--github-output", str(output)],
+                cwd=repository, check=True, capture_output=True, text=True,
+            )
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            self.assertEqual(values["android_full"], "true")
+            self.assertEqual(values["base_sha"], base_sha)
+            self.assertEqual(values["head_sha"], head_sha)
+            self.assertEqual(values["candidate_sha"], candidate_sha)
+
+
+class CandidateContractTest(unittest.TestCase):
+    def test_stale_branch_uses_candidate_first_parent_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            git(repository, "init", "-b", "main")
+            git(repository, "config", "user.name", "CI Test")
+            git(repository, "config", "user.email", "ci@example.com")
+
+            (repository / "README.md").write_text("base\n", encoding="utf-8")
+            git(repository, "add", "README.md")
+            git(repository, "commit", "-m", "base")
+
+            git(repository, "switch", "-c", "feature")
+            translation = repository / "app/src/main/res/values-ro/strings.xml"
+            translation.parent.mkdir(parents=True)
+            translation.write_text("<resources/>\n", encoding="utf-8")
+            git(repository, "add", str(translation.relative_to(repository)))
+            git(repository, "commit", "-m", "translation")
+            head_sha = git(repository, "rev-parse", "HEAD")
+
+            git(repository, "switch", "main")
+            docs = repository / "docs/upstream.md"
+            docs.parent.mkdir()
+            docs.write_text("upstream\n", encoding="utf-8")
+            git(repository, "add", str(docs.relative_to(repository)))
+            git(repository, "commit", "-m", "upstream docs")
+            base_sha = git(repository, "rev-parse", "HEAD")
+
+            git(repository, "merge", "--no-ff", "feature", "-m", "candidate")
+            candidate_sha = git(repository, "rev-parse", "HEAD")
+
+            previous_directory = Path.cwd()
+            try:
+                os.chdir(repository)
+                context = candidate_context(candidate_sha, base_sha, head_sha)
+                paths = changed_paths(context.base_sha, context.candidate_sha)
+                with self.assertRaisesRegex(ValueError, "first parent"):
+                    candidate_context(candidate_sha, head_sha, head_sha)
+                with self.assertRaisesRegex(ValueError, "second parent"):
+                    candidate_context(candidate_sha, base_sha, base_sha)
+            finally:
+                os.chdir(previous_directory)
+
+            self.assertEqual(paths, ["app/src/main/res/values-ro/strings.xml"])
+
+    def test_historical_event_base_keeps_the_candidate_diff_frozen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            git(repository, "init", "-b", "main")
+            git(repository, "config", "user.name", "CI Test")
+            git(repository, "config", "user.email", "ci@example.com")
+            (repository / "README.md").write_text("base\n", encoding="utf-8")
+            git(repository, "add", "README.md")
+            git(repository, "commit", "-m", "event base")
+            event_base_sha = git(repository, "rev-parse", "HEAD")
+
+            git(repository, "switch", "-c", "feature")
+            translation = repository / "app/src/main/res/values-ro/strings.xml"
+            translation.parent.mkdir(parents=True)
+            translation.write_text("<resources/>\n", encoding="utf-8")
+            git(repository, "add", ".")
+            git(repository, "commit", "-m", "translation")
+            head_sha = git(repository, "rev-parse", "HEAD")
+
+            git(repository, "switch", "main")
+            native = repository / "app/src/main/cpp/base.cpp"
+            native.parent.mkdir(parents=True)
+            native.write_text("// target branch update\n", encoding="utf-8")
+            git(repository, "add", ".")
+            git(repository, "commit", "-m", "advance target before candidate")
+            base_sha = git(repository, "rev-parse", "HEAD")
+            git(repository, "switch", "-c", "candidate")
+            git(repository, "merge", "--no-ff", "feature", "-m", "candidate")
+            candidate_sha = git(repository, "rev-parse", "HEAD")
+
+            git(repository, "switch", "main")
+            (repository / "app/build.gradle.kts").write_text("// later update\n", encoding="utf-8")
+            git(repository, "add", ".")
+            git(repository, "commit", "-m", "advance target after candidate")
+            later_base_sha = git(repository, "rev-parse", "HEAD")
+
+            previous_directory = Path.cwd()
+            try:
+                os.chdir(repository)
+                context = candidate_context(candidate_sha, event_base_sha, head_sha)
+                paths = changed_paths(context.base_sha, context.candidate_sha)
+                with self.assertRaisesRegex(ValueError, "first parent"):
+                    candidate_context(candidate_sha, later_base_sha, head_sha)
+            finally:
+                os.chdir(previous_directory)
+
+            self.assertEqual(context.base_sha, base_sha)
+            self.assertEqual(context.event_base_sha, event_base_sha)
+            self.assertEqual(context.head_sha, head_sha)
+            self.assertEqual(context.candidate_sha, candidate_sha)
+            self.assertEqual(paths, ["app/src/main/res/values-ro/strings.xml"])
+            plan = classify_paths(paths)
+            self.assertTrue(plan.android_resources)
+            self.assertFalse(plan.android_full)
+            self.assertFalse(plan.android_jvm)
+
+    def test_non_merge_candidate_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            git(repository, "init", "-b", "main")
+            git(repository, "config", "user.name", "CI Test")
+            git(repository, "config", "user.email", "ci@example.com")
+            (repository / "README.md").write_text("base\n", encoding="utf-8")
+            git(repository, "add", "README.md")
+            git(repository, "commit", "-m", "base")
+            commit = git(repository, "rev-parse", "HEAD")
+
+            previous_directory = Path.cwd()
+            try:
+                os.chdir(repository)
+                with self.assertRaisesRegex(ValueError, "exactly two parents"):
+                    candidate_context(commit, commit, commit)
+            finally:
+                os.chdir(previous_directory)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,223 @@
+use jni::objects::{JClass, JObjectArray, JString};
+use jni::sys::jstring;
+use jni::JNIEnv;
+use serde::Serialize;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MergePlan {
+    ok: bool,
+    error: String,
+    /// For each node index: index of the `<tool>` node that owns it, or -1.
+    owner_of: Vec<i32>,
+    /// For each `<tool>` node index: index of its paired `<tool_result>`, or -1.
+    result_of: Vec<i32>,
+    /// For each `<tool_result>` node index: index of its paired `<tool>`, or -1.
+    call_of: Vec<i32>,
+}
+
+fn fail(error: String, n: usize) -> MergePlan {
+    MergePlan {
+        ok: false,
+        error,
+        owner_of: vec![-1; n],
+        result_of: vec![-1; n],
+        call_of: vec![-1; n],
+    }
+}
+
+/// Attribute value reader that tolerates single/double quotes.
+fn attr(tag: &str, name: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut from = 0usize;
+    while let Some(pos) = tag[from..].find(name) {
+        let start = from + pos;
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after = start + name.len();
+        if before_ok && after < tag.len() {
+            let mut i = after;
+            while i < tag.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < tag.len() && bytes[i] == b'=' {
+                i += 1;
+                while i < tag.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i < tag.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                    let quote = bytes[i];
+                    let vstart = i + 1;
+                    if let Some(end) = tag[vstart..].find(quote as char) {
+                        return Some(tag[vstart..vstart + end].to_string());
+                    }
+                }
+            }
+        }
+        from = start + name.len();
+    }
+    None
+}
+
+fn tool_name_of(xml: &str) -> Option<String> {
+    let head_end = xml.find('>').map(|p| p + 1).unwrap_or(xml.len().min(512));
+    attr(&xml[..head_end], "name")
+}
+
+fn is_tag(xml: &str, wanted: &str) -> bool {
+    let t = xml.trim_start();
+    let rest = match t.strip_prefix('<') {
+        Some(r) => r,
+        None => return false,
+    };
+    if !rest.starts_with(wanted) {
+        return false;
+    }
+    match rest[wanted.len()..].chars().next() {
+        Some(c) => c.is_whitespace() || c == '>' || c == '/',
+        None => false,
+    }
+}
+
+fn plan(nodes: &[String]) -> MergePlan {
+    let n = nodes.len();
+    let mut owner_of = vec![-1i32; n];
+    let mut result_of = vec![-1i32; n];
+    let mut call_of = vec![-1i32; n];
+
+    let mut pending: Vec<usize> = Vec::new();
+    let mut last_owner: i32 = -1;
+
+    for (i, xml) in nodes.iter().enumerate() {
+        if is_tag(xml, "tool_result") {
+            let result_name = tool_name_of(xml);
+            // Operit2 pairs strictly in call order: result.matchToolName == callNames[resultCount].
+            let mut matched: Option<usize> = None;
+            if !pending.is_empty() {
+                let head = pending[0];
+                let call_name = tool_name_of(&nodes[head]);
+                let same = match (&call_name, &result_name) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if same {
+                    matched = Some(head);
+                }
+            }
+            match matched {
+                Some(call_index) => {
+                    pending.remove(0);
+                    result_of[call_index] = i as i32;
+                    call_of[i] = call_index as i32;
+                    owner_of[i] = call_index as i32;
+                    last_owner = call_index as i32;
+                }
+                None => {
+                    owner_of[i] = last_owner;
+                }
+            }
+        } else if is_tag(xml, "tool") {
+            pending.push(i);
+            owner_of[i] = i as i32;
+            last_owner = i as i32;
+        } else {
+            owner_of[i] = last_owner;
+        }
+    }
+
+    MergePlan { ok: true, error: String::new(), owner_of, result_of, call_of }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_ai_assistance_operit_ui_common_markdown_NativeXmlGroup_planJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    nodes: JObjectArray,
+) -> jstring {
+    let parsed: Result<Vec<String>, String> = (|| {
+        if nodes.is_null() {
+            return Ok(Vec::new());
+        }
+        let len = env
+            .get_array_length(&nodes)
+            .map_err(|e| format!("get_array_length failed: {e}"))?;
+        let mut out = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let obj = env
+                .get_object_array_element(&nodes, i)
+                .map_err(|e| format!("element {i} failed: {e}"))?;
+            let s: JString = obj.into();
+            let rust: String = env
+                .get_string(&s)
+                .map_err(|e| format!("get_string {i} failed: {e}"))?
+                .into();
+            out.push(rust);
+        }
+        Ok(out)
+    })();
+
+    let response = match parsed {
+        Ok(list) => plan(&list),
+        Err(error) => fail(error, 0),
+    };
+
+    let json = serde_json::to_string(&response)
+        .unwrap_or_else(|e| format!(r#"{{"ok":false,"error":"encode failed: {e}","ownerOf":[],"resultOf":[],"callOf":[]}}"#));
+    env.new_string(json)
+        .map(|v| v.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IconResponse {
+    ok: bool,
+    icon: String,
+}
+
+/// Operit2 `toolDisplayIcon` (`ToolDisplayComponents.dart:292-314`): maps the
+/// declared semantic icon field, not the tool name.
+fn icon_for(semantic: &str) -> &'static str {
+    match semantic {
+        "file" => "description_outlined",
+        "folder" => "folder_outlined",
+        "edit" => "edit_outlined",
+        "delete" => "delete_outline",
+        "search" => "search",
+        "terminal" => "terminal",
+        "web" => "language",
+        "download" => "download_outlined",
+        "package" => "extension_outlined",
+        "time" => "schedule",
+        "notification" => "notifications_outlined",
+        "clipboard" => "content_paste",
+        "audio" => "volume_up_outlined",
+        "info" => "info_outline",
+        "screen" => "screenshot_outlined",
+        "tap" => "touch_app_outlined",
+        "double_tap" => "ads_click",
+        "long_press" => "pan_tool_outlined",
+        "swipe" => "swipe_outlined",
+        "keyboard" => "keyboard_outlined",
+        _ => "build_outlined",
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_ai_assistance_operit_ui_common_markdown_NativeXmlGroup_iconForJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    semantic: JString,
+) -> jstring {
+    let value: String = env
+        .get_string(&semantic)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let response = IconResponse { ok: true, icon: icon_for(value.trim()).to_string() };
+    let json = serde_json::to_string(&response).unwrap_or_else(|_| {
+        r#"{"ok":false,"icon":"build_outlined"}"#.to_string()
+    });
+    env.new_string(json)
+        .map(|v| v.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}

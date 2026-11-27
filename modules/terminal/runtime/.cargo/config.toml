@@ -1,0 +1,7 @@
+# Target-scoped rustflags: host builds (`cargo test` on Windows) stay untouched.
+#
+# The NDK's `*-clang.cmd` wrappers are batch files and corrupt `-Wl,--version-script=...`
+# arguments, so build-android.ps1 points the linker at `clang.exe` and the target triple
+# is supplied here instead.
+[target.aarch64-linux-android]
+rustflags = ["-Clink-arg=--target=aarch64-linux-android26"]

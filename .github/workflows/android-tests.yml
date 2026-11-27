@@ -1,0 +1,271 @@
+name: Android Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_device_tests:
+        description: Build Android instrumentation APK for subagent lifecycle checks
+        required: false
+        default: false
+        type: boolean
+  push:
+    # 专用组合候选与主分支使用相同的回归入口。
+    branches: [main, ci/release-28-integration]
+    paths:
+      - .github/workflows/android-tests.yml
+      - .gitmodules
+      - .npmrc
+      - app/**
+      - build.gradle.kts
+      - ci/script/download_android_dependencies.sh
+      - ci/script/prepare_android_dependencies.py
+      - ci/test/code_runner.test.cjs
+      - ci/test/workspace_change_context.test.cjs
+      - ci/mermaid-native/**
+      - ci/markdown-native/**
+      - cmake/**
+      - plugins/examples/**
+      - gradle/**
+      - gradle.properties
+      - gradlew
+      - gradlew.bat
+      - modules/a2ui-compat/**
+      - modules/llm/**
+      - modules/material-icons-subset/**
+      - package.json
+      - package-lock.json
+      - npm-shrinkwrap.json
+      - pnpm-workspace.yaml
+      - modules/quickjs/**
+      - settings.gradle.kts
+      - modules/showerclient/**
+      - modules/terminal/**
+      - modules/terminal
+      - tools/native_ripgrep/**
+      - tools/native_apply_patch/**
+      - tools/web_chat_cli/**
+      - tools/html_build_cli/**
+      - tools/terminal_commands/**
+      - .github/actions/terminal-commands/**
+      - plugins/tooling/example_packages/**
+      - app/web-chat/**
+
+concurrency:
+  group: android-tests-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  JAVA_VERSION: '21'
+  ANDROID_BUILD_TOOLS_VERSION: '35.0.0'
+  ANDROID_NDK_VERSION: '25.1.8937393'
+  ANDROID_API_LEVEL: '26'
+  RUST_VERSION: '1.88.0'
+  MANUAL_DEPS_DIR: manual-deps
+
+jobs:
+  code-runner:
+    name: Code Runner regression tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+
+      - name: Run Code Runner regression tests
+        run: node --test ci/test/code_runner.test.cjs ci/test/test_openai_draw_optional_frames.cjs ci/test/shell_command_bridge.test.cjs ci/test/workspace_change_context.test.cjs ci/test/web_visit_blocking.test.cjs
+
+  mermaid-native:
+    name: Markdown and Mermaid native core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+      - name: Set up JDK
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Download Gradle toolchain
+        run: ./gradlew --version
+      - name: Check native parsing layout and viewport
+        shell: bash
+        run: |
+          shopt -s nullglob
+          operit_mermaid_compilers=("${GRADLE_USER_HOME:-$HOME/.gradle}"/wrapper/dists/gradle-8.13-bin/*/gradle-8.13/lib/kotlin-compiler-embeddable-*.jar)
+          if [ "${#operit_mermaid_compilers[@]}" -ne 1 ]; then
+            printf 'Expected one Gradle 8.13 Kotlin compiler, found %s\n' "${#operit_mermaid_compilers[@]}" >&2
+            exit 1
+          fi
+          bash ci/mermaid-native/run-core.sh "${operit_mermaid_compilers[0]%/*}"
+          bash ci/markdown-native/run-core.sh "${operit_mermaid_compilers[0]%/*}"
+          bash ci/markdown-native/run-stream.sh
+
+  tests:
+    name: Android JVM tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Initialize terminal submodule
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule sync -- modules/terminal
+          git submodule update --init --recursive --depth 1 modules/terminal
+          git submodule status -- modules/terminal
+
+      - name: Set up JDK
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: ''
+
+      - name: Install required Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-36" \
+            "build-tools;$ANDROID_BUILD_TOOLS_VERSION" \
+            "ndk;$ANDROID_NDK_VERSION"
+
+      - name: Restore Android dependency cache
+        id: cache-manual-deps
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.MANUAL_DEPS_DIR }}
+          key: android-full-deps-${{ runner.os }}-${{ hashFiles('ci/script/download_android_dependencies.sh', 'ci/script/prepare_android_dependencies.py') }}
+
+      - name: Restore generated STT asset cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: app/build/generated/stt-model-assets
+          key: stt-model-assets-${{ runner.os }}-${{ hashFiles('app/config/stt-model-assets.properties') }}
+
+      - name: Download Android dependencies
+        if: steps.cache-manual-deps.outputs.cache-hit != 'true'
+        run: bash ci/script/download_android_dependencies.sh full "$MANUAL_DEPS_DIR"
+
+      - name: Prepare Android dependencies
+        run: |
+          python3 ci/script/prepare_android_dependencies.py \
+            --profile full \
+            --archives "$MANUAL_DEPS_DIR" \
+            --repository "$GITHUB_WORKSPACE"
+
+      - name: Prepare terminal apply_patch
+        uses: ./.github/actions/terminal-commands
+        with:
+          run-tests: 'true'
+
+      - name: Restore native ripgrep cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/native_ripgrep/target
+          key: native-ripgrep-arm64-${{ runner.os }}-${{ runner.arch }}-ndk-${{ env.ANDROID_NDK_VERSION }}-api-${{ env.ANDROID_API_LEVEL }}-rust-${{ env.RUST_VERSION }}-${{ hashFiles('tools/native_ripgrep/Cargo.toml', 'tools/native_ripgrep/Cargo.lock', 'tools/native_ripgrep/**/*.rs', 'tools/native_ripgrep/build_native_ripgrep.ps1') }}
+
+      - name: Build native ripgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API_LEVEL}-clang"
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup target add --toolchain "$RUST_VERSION" aarch64-linux-android
+          cargo "+$RUST_VERSION" build \
+            --manifest-path tools/native_ripgrep/Cargo.toml \
+            --release \
+            --target aarch64-linux-android \
+            --locked
+          install -Dm755 \
+            tools/native_ripgrep/target/aarch64-linux-android/release/liboperit_ripgrep.so \
+            app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+          test -s app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+
+      - name: Configure Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Run JVM unit tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
+
+      - name: Compile Android instrumentation tests
+        run: ./gradlew :app:compileDebugAndroidTestKotlin :app:compileDebugAndroidTestJavaWithJavac --stacktrace --no-daemon
+
+      - name: Build subagent device-test APK pair
+        if: (github.event_name == 'workflow_dispatch' && inputs.build_device_tests) || (github.event_name == 'push' && github.ref == 'refs/heads/ci/release-28-integration')
+        run: ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest --stacktrace --no-daemon
+
+      - name: Upload subagent device-test APK
+        if: success() && ((github.event_name == 'workflow_dispatch' && inputs.build_device_tests) || (github.event_name == 'push' && github.ref == 'refs/heads/ci/release-28-integration'))
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: operit-subagent-device-tests-${{ github.run_number }}
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/androidTest/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Android test reports
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: operit-android-test-reports-${{ github.run_number }}
+          path: |
+            app/build/reports/**
+            build/reports/**
+          if-no-files-found: warn
+          retention-days: 14

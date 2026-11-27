@@ -1,0 +1,25 @@
+[package]
+name = "operit-terminal"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "operit_terminal"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+lzma-rs = "0.3"
+tar = "0.4"
+sha2 = "0.10"
+
+# The JNI surface only exists in the Android build; on the host (`cargo test`) the
+# crate is a plain rlib with no libjvm link requirement.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
