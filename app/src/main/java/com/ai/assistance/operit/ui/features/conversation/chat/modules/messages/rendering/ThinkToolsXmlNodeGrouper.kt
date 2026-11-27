@@ -515,6 +515,8 @@ private fun extractRawXmlTagName(xml: String): String? {
 }
 
 private fun extractToolName(xml: String): String? {
+    // 流式渲染每帧对每个 tool 节点调用；Rust 线性扫描替代正则 Matcher。
+    NativeXmlGroup.nameAttr(xml)?.let { return it }
     val nameMatch = ChatMarkupRegex.nameAttr.find(xml)
     return nameMatch?.groupValues?.getOrNull(1)
 }
