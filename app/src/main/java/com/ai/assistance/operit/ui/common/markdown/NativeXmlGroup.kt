@@ -29,6 +29,8 @@ internal object NativeXmlGroup {
 
     @JvmStatic
     private external fun iconForJson(semantic: String): String
+    @JvmStatic
+    private external fun tagNameJni(xml: String): String?
 
     /** 配对结果；长度与输入节点数一致，-1 表示无。 */
     internal data class MergePlan(
@@ -56,6 +58,22 @@ internal object NativeXmlGroup {
                 resultOf = obj.optJSONArray("resultOf").toIntArray(n),
                 callOf = obj.optJSONArray("callOf").toIntArray(n),
             )
+        } catch (error: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 取 XML 片段的首标签名，语义等同 ChatMarkupRegex.extractOpeningTagName。
+     *
+     * 走 Rust 的理由：流式渲染时每个节点每一帧都会调用它，Kotlin 侧的
+     * java.util.regex 每次都要分配 Matcher 与分组数组；Rust 只做一次扫描。
+     * 失败时返回 null，调用方回退到原有正则路径，行为不变。
+     */
+    internal fun tagName(xml: String): String? {
+        if (!loaded || xml.isEmpty()) return null
+        return try {
+            tagNameJni(xml)?.takeIf { it.isNotEmpty() }
         } catch (error: Throwable) {
             null
         }
