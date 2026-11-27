@@ -521,8 +521,14 @@ private fun extractToolName(xml: String): String? {
 
 private fun isXmlFullyClosed(xml: String): Boolean {
     val tagName = extractRawXmlTagName(xml) ?: return false
+    // thinking 标签的闭合规则由 ThinkingMarkup 决定，与通用 XML 不同，
+    // 必须先分流，否则 Rust 快路径会给出错误结果。
+    if (!ThinkingMarkup.isThinkingTag(tagName)) {
+        // 流式渲染时每个节点每帧都会调用，Rust 侧一次扫描完成。
+        NativeXmlGroup.isFullyClosed(xml)?.let { return it }
+    }
     val trimmed = xml.trim()
-    if (trimmed.endsWith("/>") || trimmed.startsWith("<$tagName") && trimmed.endsWith("/>")) {
+    if (trimmed.endsWith("/>")) {
         return true
     }
     if (ThinkingMarkup.isThinkingTag(tagName)) {
