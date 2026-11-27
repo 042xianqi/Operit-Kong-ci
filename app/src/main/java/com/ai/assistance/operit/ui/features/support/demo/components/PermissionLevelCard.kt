@@ -528,25 +528,27 @@ private fun PermissionStatusItem(title: String, isGranted: Boolean, onClick: () 
                     Modifier.fillMaxWidth()
                             .clickable(onClick = onClick)
                             .padding(vertical = 6.dp, horizontal = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+            verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-            // 状态指示点
-            Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(contentColor))
+        // 固定 16dp 图标位：与 FeatureItem 的图标起点一致，所有行文字才对齐成一条直线。
+        Icon(
+                imageVector = if (isGranted) Icons.Default.CheckCircle else Icons.Default.Lock,
+                contentDescription = null,
+                tint = contentColor,
+                modifier = Modifier.size(16.dp)
+        )
 
-            Spacer(modifier = Modifier.width(8.dp))
+        Spacer(modifier = Modifier.width(8.dp))
 
-            // 权限名称
-            Text(
-                    text = title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.weight(1f)
-            )
-        }
+        // 标题保持自然宽度，不用 weight：否则状态文字会被推到最右，与其它行错开。
+        Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f, fill = false)
+        )
 
-        // 状态文本
+        // 状态跟随标题，紧排在后面，不再单独右对齐。
         Text(
                 text = statusLabel ?: statusText,
                 style = MaterialTheme.typography.bodySmall,
