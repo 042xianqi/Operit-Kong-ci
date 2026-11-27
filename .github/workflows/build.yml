@@ -317,6 +317,11 @@ jobs:
 
       - name: Run Gradle build
         env:
+          # 云端 runner 是 ubuntu-24.04（16GB），gradle.properties 里那套数值是为本地
+          # 6.9GB 机器定的。Kotlin daemon 只给 4G 时，:app:compileDebugKotlin 的
+          # 25 参数 Composable（PermissionLevelCard.kt）会撞 OutOfMemoryError:
+          # GC overhead limit exceeded。这里按 runner 实际内存放宽。
+          GRADLE_OPTS: -Xmx6g
           DISPATCH_GRADLE_TASK: ${{ inputs.gradle_task }}
           EVENT_NAME: ${{ github.event_name }}
           OPERIT_DISTRIBUTION_STORE_PASSWORD: ${{ secrets.OPERIT_DISTRIBUTION_STORE_PASSWORD }}
@@ -329,7 +334,7 @@ jobs:
             *) echo "Unsupported workflow event: $EVENT_NAME" >&2; exit 2 ;;
           esac
           chmod +x ./gradlew
-          ./gradlew "$gradle_task" --stacktrace --no-daemon
+          ./gradlew "$gradle_task" --stacktrace --no-daemon -Pkotlin.daemon.jvmargs=-Xmx8g
 
       # 正式发布前先通过同份源码的回归与仪器测试编译，避免紧急包绕过验证。
       - name: Verify release regressions
