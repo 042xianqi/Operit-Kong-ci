@@ -118,7 +118,8 @@ internal fun CanvasToolSummaryRow(
     )
 
     Row(
-        modifier = modifier.fillMaxWidth().then(clickableModifier),
+        // Operit2 `ChatActivityRowStyle.headerPadding`：vertical 5。
+        modifier = modifier.fillMaxWidth().padding(vertical = TOOL_ROW_HEADER_PAD).then(clickableModifier),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
@@ -129,12 +130,13 @@ internal fun CanvasToolSummaryRow(
         )
         Spacer(modifier = Modifier.width(TOOL_ROW_ICON_GAP))
         // 工具名占据自己的列：多个工具行叠在一起时，右侧的状态标记能够对齐成一条竖线。
+        // Operit2 `ToolDisplayComponents.dart:453`：工具名是自然宽度，不分配权重。
+        // 分配权重会让每一行的文字起点随内容长度浮动，无法对齐成一条直线。
         Text(
             text = toolName,
             style = textStyle,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f, fill = false),
         )
         if (trailingText.isNotEmpty()) {
             Spacer(modifier = Modifier.width(TOOL_ROW_ICON_GAP))
@@ -143,7 +145,7 @@ internal fun CanvasToolSummaryRow(
                 style = textStyle,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(2f),
+                modifier = Modifier.weight(1f, fill = false),
             )
         } else if (summary.isNotEmpty()) {
             Spacer(modifier = Modifier.width(TOOL_ROW_ICON_GAP))
@@ -152,7 +154,7 @@ internal fun CanvasToolSummaryRow(
                 style = textStyle,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(2f),
+                modifier = Modifier.weight(1f, fill = false),
             )
         } else {
             Spacer(modifier = Modifier.weight(1f))
@@ -192,9 +194,10 @@ internal fun CanvasToolSummaryRow(
 
 /** Operit2 `ChatActivityRowStyle`：iconSize 16 / iconGap 8 / headerPadding vertical 5。 */
 private val TOOL_ROW_ICON_SIZE = 16.dp
-private val TOOL_ROW_ICON_GAP = 6.dp
+private val TOOL_ROW_ICON_GAP = 8.dp
 private val TOOL_ROW_STATUS_SIZE = 14.dp
 private val TOOL_ROW_CURSOR_GAP = 4.dp
+private val TOOL_ROW_HEADER_PAD = 5.dp
 
 private fun String.toCanvasSingleLineText(): String {
     val normalized = replace('\r', ' ').replace('\n', ' ').trim()
