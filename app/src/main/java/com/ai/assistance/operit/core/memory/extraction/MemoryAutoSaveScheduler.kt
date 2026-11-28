@@ -96,11 +96,19 @@ class MemoryAutoSaveScheduler(
 
             val repository = MemoryAutoSaveCandidateRepository(context, profileId)
             val allCandidates = repository.getPendingAndFailedCandidates()
-            if (allCandidates.size < MIN_TOTAL_CANDIDATES_TO_EXTRACT) {
+            // 每轮都记录候选数量：队列长期为空是“记忆不保存”的最直接症状，
+            // 没有这条日志就只能看到轮询器启动、之后彻底静默。
+            AppLogger.d(
+                TAG,
+                "扫描长期记忆候选: profileId=$profileId, candidates=${allCandidates.size}, nextRunAt=$nextRunAtMs, now=$nowMs"
+            )
+            // 阈值不再阻断处理：只要有一条候选就抽取。原实现要求累计 5 条，
+            // 短会话永远达不到，而且每次检查都把下次执行时间往后推，越用越不会保存。
+            if (allCandidates.isEmpty()) {
                 val nextRunAt = System.currentTimeMillis() + intervalMs
                 AppLogger.d(
                     TAG,
-                    "候选总条数不足，继续累计并重置下次执行时间: profileId=$profileId, totalCandidates=${allCandidates.size}, minimumCandidates=$MIN_TOTAL_CANDIDATES_TO_EXTRACT, nextRunAt=$nextRunAt"
+                    "没有待处理候选，重置下次执行时间: profileId=$profileId, nextRunAt=$nextRunAt"
                 )
                 scheduleNextRun(profileId, nextRunAt)
                 continue
