@@ -200,6 +200,18 @@ class TerminalManager private constructor(
      * `installed-rootfs/<dir>` 已就位但没有 profile 的实例补登记进来。
      */
     suspend fun loadProfileSettings(): TerminalProfileSettings = profileMutex.withLock {
+        loadProfileSettingsLocked()
+    }
+
+    /**
+     * [loadProfileSettings] 的无锁版本。
+     *
+     * 调用方**必须已持有** [profileMutex]，否则会有数据竞争。
+     * 存在的理由是 Kotlin 的 [Mutex] 不可重入：如果持锁方法内部再调
+     * [loadProfileSettings]，`withLock` 会永久阻塞（自死锁）。
+     * 所以凡是已在 `profileMutex.withLock { }` 内部的路径，都必须走这个版本。
+     */
+    private suspend fun loadProfileSettingsLocked(): TerminalProfileSettings {
         profileSettings?.let { return it }
         val fromDisk = profileStore.load()
         val resolved =
@@ -209,7 +221,7 @@ class TerminalManager private constructor(
                 defaults
             }
         profileSettings = resolved
-        resolved
+        return resolved
     }
 
     /**
@@ -266,7 +278,7 @@ class TerminalManager private constructor(
      */
     suspend fun switchActiveProfile(profileId: String): Result<Unit> = runCatching {
         val settings = profileMutex.withLock {
-            val current = loadProfileSettings()
+            val current = loadProfileSettingsLocked()
             val updated = requireNotNull(current.withDefault(profileId)) {
                 "Unknown terminal profile: $profileId"
             }
@@ -286,7 +298,7 @@ class TerminalManager private constructor(
     suspend fun upsertProfile(profile: TerminalProfile, makeDefault: Boolean): Result<Unit> =
         runCatching {
             val settings = profileMutex.withLock {
-                val current = loadProfileSettings()
+                val current = loadProfileSettingsLocked()
                 val profiles =
                     current.profiles.filterNot { it.id == profile.id } + profile
                 val updated =
@@ -308,7 +320,7 @@ class TerminalManager private constructor(
     /** 移除实例。不允许移除最后一个，也不允许移除当前默认实例。 */
     suspend fun removeProfile(profileId: String): Result<Unit> = runCatching {
         profileMutex.withLock {
-            val current = loadProfileSettings()
+            val current = loadProfileSettingsLocked()
             requireNotNull(current.withoutProfile(profileId)) {
                 "Unknown terminal profile: $profileId"
             }.let { updated ->
