@@ -36,7 +36,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.ai.assistance.operit.R
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -87,7 +86,7 @@ fun CompactToolDisplay(
 
     val summary = remember(displayParams) { buildParamsHeadPreview(displayParams) }
 
-    CanvasToolSummaryRow(
+    ToolSummaryRow(
         toolName = resolved.title,
         summary = summary,
         semanticDescription = semanticDescription,
@@ -149,7 +148,7 @@ fun DetailedToolDisplay(
         )
     }
 
-    CanvasToolSummaryRow(
+    ToolSummaryRow(
         toolName = resolved.title,
         summary = paramsSizeLabel,
         semanticDescription = semanticDescription,
@@ -229,8 +228,7 @@ internal fun CodeContentWithLineNumbers(
                             text = "${index + 1}",
                             style =
                                     MaterialTheme.typography.bodySmall.copy(
-                                            fontFamily = FontFamily.Monospace,
-                                            fontSize = 10.sp
+                                            fontFamily = FontFamily.Monospace
                                     ),
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
                     )
@@ -264,8 +262,7 @@ internal fun CodeContentWithLineNumbers(
                                 text = line,
                                 style =
                                         MaterialTheme.typography.bodySmall.copy(
-                                                fontFamily = FontFamily.Monospace,
-                                                fontSize = 11.sp
+                                                fontFamily = FontFamily.Monospace
                                         ),
                                 color = textColor.copy(alpha = 0.8f),
                                 softWrap = true
@@ -366,7 +363,6 @@ internal fun FormattedXmlText(text: String, textColor: Color, modifier: Modifier
             style =
                     MaterialTheme.typography.bodySmall.copy(
                             fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp,
                             color = textColor
                     ),
             softWrap = true,
