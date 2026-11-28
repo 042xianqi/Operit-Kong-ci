@@ -50,6 +50,71 @@ enum class PermissionLevel {
 }
 
 /**
+ * 工具操作对运行环境的效应，对齐 Operit2 `ToolEffect`
+ * (`ToolPermissionSystem.rs:11`)。
+ *
+ * 为什么需要：Kong 原来只有 ALLOW/ASK/FORBID 一个维度，无法表达
+ * "只读可放行、写入必须问" 这种最常见的策略。Operit2 用
+ * `AiPermissionMode.ReadOnly` 挡掉所有 WRITE，Kong 只能用 FORBID
+ * 一刀切，用户要么全放开要么全禁。
+ */
+enum class ToolEffect {
+    /** 只读取环境，不改变任何状态。 */
+    READ,
+    /** 会写入文件、改设置、发请求或执行命令。 */
+    WRITE;
+
+    companion object {
+        /**
+         * 由工具名判定读数效应。
+         *
+         * `AITool` 只有 name/parameters/description，没有读写标记，
+         * 因此只能按动词前缀判定。规则与 Operit2 的
+         * `ToolEffect` 归类意图一致：查询类放行，变更类必须问。
+         *
+         * 判定失败的默认是 WRITE —— 宁可多问一次也不能静默放行。
+         */
+        private val READ_PREFIXES = listOf(
+            "get_", "list_", "read_", "query_", "search_", "find_", "grep_",
+            "scan_", "view_", "show_", "check_", "count_", "inspect_", "tree_",
+            "stat_", "exists_", "download_", "fetch_", "browse_", "visit_",
+        )
+
+        fun of(tool: AITool): ToolEffect {
+            val name = tool.name.lowercase()
+            return if (READ_PREFIXES.any { name.startsWith(it) }) READ else WRITE
+        }
+    }
+}
+
+/**
+ * 会话级放行名单，对齐 Operit2 `ToolPermissionSystem.sessionApprovedTools`
+ * (`ToolPermissionSystem.rs:74`)。
+ *
+ * 用户在一次运行中选了 "本次允许"，后续同名工具不再重复弹窗；
+ * 进程结束后自动失效，不落盘，避免把临时决定变成永久授权。
+ */
+internal object SessionApprovedTools {
+    private val approved = ConcurrentHashMap.newKeySet<String>()
+
+    fun approve(toolName: String) {
+        if (toolName.isNotBlank()) approved.add(toolName)
+    }
+
+    fun isApproved(toolName: String): Boolean = approved.contains(toolName)
+
+    fun revoke(toolName: String) {
+        approved.remove(toolName)
+    }
+
+    fun clear() {
+        approved.clear()
+    }
+
+    internal fun snapshot(): Set<String> = approved.toSet()
+}
+
+/**
  * Centralized tool permission system that manages both permission storage and checking
  */
 class ToolPermissionSystem private constructor(private val context: Context) {
@@ -229,7 +294,15 @@ class ToolPermissionSystem private constructor(private val context: Context) {
         val overrideLevel = preferences[key]?.let { PermissionLevel.fromString(it) }
         
         val permissionLevel = overrideLevel ?: masterSwitch
-        
+
+        // 会话级放行优先于 ASK：用户在本次运行里已经点过“本次允许”就不再弹窗。
+        // 对应 Operit2 `ToolPermissionSystem.sessionApprovedTools`。
+        // 只有 ALLOW 和会话放行才直接过，FORBID 不受影响。
+        if (permissionLevel != PermissionLevel.FORBID && SessionApprovedTools.isApproved(tool.name)) {
+            AppLogger.d(TAG, "Session-approved, granting: ${tool.name}")
+            return ToolPermissionCheckResult.GRANTED
+        }
+
         return when (permissionLevel) {
             PermissionLevel.ALLOW -> ToolPermissionCheckResult.GRANTED
             PermissionLevel.ASK -> requestPermission(tool)
