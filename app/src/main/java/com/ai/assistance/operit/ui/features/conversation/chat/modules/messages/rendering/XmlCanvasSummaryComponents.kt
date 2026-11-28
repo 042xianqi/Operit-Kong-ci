@@ -67,7 +67,7 @@ import kotlin.math.max
 private const val CANVAS_SINGLE_LINE_TEXT_LIMIT = 160
 
 @Composable
-internal fun CanvasToolSummaryRow(
+internal fun ToolSummaryRow(
     toolName: String,
     summary: String,
     semanticDescription: String,
@@ -199,6 +199,15 @@ private val TOOL_ROW_STATUS_SIZE = 14.dp
 private val TOOL_ROW_CURSOR_GAP = 4.dp
 private val TOOL_ROW_HEADER_PAD = 5.dp
 
+/**
+ * 结果行的内缩。Operit2 `ChatActivityDisclosure.contentInset`
+ * = iconSize + iconGap = 16 + 8 = 24，左内缩对齐摘要行的图标右缘；右侧取 16。
+ */
+private val TOOL_RESULT_INSET_START = 24.dp
+private val TOOL_RESULT_INSET_END = 16.dp
+/** 尾部复制按钮的点击/占位宽度（图标本身用 TOOL_ROW_STATUS_SIZE）。 */
+private val TOOL_ROW_COPY_SLOT = 24.dp
+
 private fun String.toCanvasSingleLineText(): String {
     val normalized = replace('\r', ' ').replace('\n', ' ').trim()
     return if (normalized.length <= CANVAS_SINGLE_LINE_TEXT_LIMIT) {
@@ -233,9 +242,9 @@ internal fun CanvasToolResultRow(
     val copyPainter = rememberVectorPainter(Icons.Default.ContentCopy)
     val summaryColor =
         if (isSuccess) {
-            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
+            MaterialTheme.colorScheme.onSurfaceVariant
         } else {
-            MaterialTheme.colorScheme.error.copy(alpha = 0.8f)
+            MaterialTheme.colorScheme.error
         }
     val summaryStyle =
         MaterialTheme.typography.bodySmall.copy(
@@ -277,14 +286,14 @@ internal fun CanvasToolResultRow(
                 .then(rowModifier)
     ) {
         val widthPx = with(density) { maxWidth.roundToPx() }.fastCoerceAtLeast(1)
-        val startPaddingPx = with(density) { 24.dp.roundToPx() }
-        val endPaddingPx = with(density) { 16.dp.roundToPx() }
-        val verticalPaddingPx = with(density) { 2.dp.roundToPx() }
-        val arrowSizePx = with(density) { 18.dp.roundToPx().toFloat() }
-        val statusSizePx = with(density) { 14.dp.roundToPx().toFloat() }
-        val gapPx = with(density) { 8.dp.roundToPx().toFloat() }
-        val trailingSlotPx = if (onCopyClick != null) with(density) { 24.dp.roundToPx() } else 0
-        val trailingIconPx = with(density) { 14.dp.roundToPx().toFloat() }
+        val startPaddingPx = with(density) { TOOL_RESULT_INSET_START.roundToPx() }
+        val endPaddingPx = with(density) { TOOL_RESULT_INSET_END.roundToPx() }
+        val verticalPaddingPx = with(density) { TOOL_ROW_HEADER_PAD.roundToPx() }
+        val arrowSizePx = with(density) { TOOL_ROW_ICON_SIZE.roundToPx().toFloat() }
+        val statusSizePx = with(density) { TOOL_ROW_STATUS_SIZE.roundToPx().toFloat() }
+        val gapPx = with(density) { TOOL_ROW_ICON_GAP.roundToPx().toFloat() }
+        val trailingSlotPx = if (onCopyClick != null) with(density) { TOOL_ROW_COPY_SLOT.roundToPx() } else 0
+        val trailingIconPx = with(density) { TOOL_ROW_STATUS_SIZE.roundToPx().toFloat() }
 
         val summaryWidthPx =
             (widthPx - startPaddingPx - endPaddingPx - arrowSizePx.toInt() - gapPx.toInt() -
