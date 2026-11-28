@@ -2256,6 +2256,15 @@ class EnhancedAIService private constructor(context: Context) {
             }
         }
 
+        // 三个条件任一为假都会让候选永远不入队，进而使记忆永远不保存。
+        // 先无条件记录判定结果，避免再次出现“只有轮询器启动日志”这种无线索状态。
+        AppLogger.d(
+            TAG,
+            "记忆自动保存入队判定: enable=" + enableMemoryAutoUpdate + 
+                ", isSubTask=" + isSubTask + 
+                ", contentBlank=" + content.isBlank() + 
+                ", chatId=" + chatId
+        )
         if (enableMemoryAutoUpdate && !isSubTask && content.isNotBlank()) {
             runCatching {
                 val currentChatId = chatId?.takeIf { it.isNotBlank() }
