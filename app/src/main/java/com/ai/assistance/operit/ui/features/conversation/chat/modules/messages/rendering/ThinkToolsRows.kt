@@ -91,11 +91,21 @@ internal fun buildThinkToolsRows(
                 }
             }
             is MarkdownGroupedItem.Merged -> {
+                // 合并项包含 call 与 result 两个节点。只渲染 callIndex 会让
+                // 工具输出内容整块消失：consumedEnd 会跳过 resultIndex，
+                // 若不在这里补上就再没有别处渲染它。
                 val callIndex = item.callIndex
                 if (callIndex in nodes.indices) {
                     val node = nodes[callIndex]
                     if (isVisibleChatMarkdownNode(node, showThinkingProcess, showStatusTags)) {
                         add(ThinkToolsRow.Content(callIndex, false, "merged-" + nodeKeys[callIndex]))
+                    }
+                }
+                val resultIndex = item.resultIndex
+                if (resultIndex in nodes.indices && resultIndex != callIndex) {
+                    val resultNode = nodes[resultIndex]
+                    if (isVisibleChatMarkdownNode(resultNode, showThinkingProcess, showStatusTags)) {
+                        add(ThinkToolsRow.Content(resultIndex, false, "merged-result-" + nodeKeys[resultIndex]))
                     }
                 }
             }
